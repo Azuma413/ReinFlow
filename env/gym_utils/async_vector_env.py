@@ -1,25 +1,3 @@
-# MIT License
-#
-# Copyright (c) 2024 Intelligent Robot Motion Lab
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
 """
 From gym==0.22.0
 
@@ -154,7 +132,7 @@ class AsyncVectorEnv(VectorEnv):
         dummy_env_fn=None,
         observation_space=None,
         action_space=None,
-        shared_memory=True,
+        shared_memory=True, # True
         copy=True,
         context=None,
         daemon=True,
@@ -697,7 +675,14 @@ class AsyncVectorEnv(VectorEnv):
         for method_arg, remote in zip(method_arg_list, target_remotes):
             method_kwargs = {method_arg_name: method_arg}
             remote.send(("_call_sync", (method_name, method_kwargs)))
-        return [remote.recv() for remote in target_remotes]
+        results = []
+        successes = []
+        for remote in target_remotes:
+            result, success = remote.recv()
+            results.append(result)
+            successes.append(success)
+        self._raise_if_errors(successes)
+        return results
 
     def _get_target_remotes(self, indices):
         """Get the connection object needed to communicate with the wanted
@@ -758,8 +743,18 @@ def _worker(index, env_fn, pipe, parent_pipe, shared_memory, error_queue):
                 pipe.send((None, True))
                 break
             elif command == "_call_sync":
-                function = getattr(env, data[0])
-                pipe.send((function(**data[1]), True))
+                function_name = data[0]
+                function_kwargs = data[1]
+                if function_name == "reset":
+                    kwargs = dict(function_kwargs)
+                    if 'options' in kwargs and isinstance(kwargs.get('options'), dict):
+                        kwargs['options'].pop('return_info', None)
+                    kwargs.pop('return_info', None)
+                    result = env.reset(**kwargs)
+                    pipe.send((result, True))
+                else:
+                    function = getattr(env, function_name)
+                    pipe.send((function(**function_kwargs), True))
             elif command == "_call":
                 name, args, kwargs = data
                 if name in ["reset", "step", "seed", "close"]:
@@ -830,8 +825,21 @@ def _worker_shared_memory(index, env_fn, pipe, parent_pipe, shared_memory, error
                 pipe.send((None, True))
                 break
             elif command == "_call_sync":
-                function = getattr(env, data[0])
-                pipe.send((function(**data[1]), True))
+                function_name = data[0]
+                function_kwargs = data[1]
+                if function_name == "reset":
+                    kwargs = dict(function_kwargs)
+                    if 'options' in kwargs and isinstance(kwargs.get('options'), dict):
+                        kwargs['options'].pop('return_info', None)
+                    kwargs.pop('return_info', None)
+                    result = env.reset(**kwargs)
+                    write_to_shared_memory(
+                        observation_space, index, result[0], shared_memory
+                    )
+                    pipe.send((result, True))
+                else:
+                    function = getattr(env, function_name)
+                    pipe.send((function(**function_kwargs), True))
             elif command == "_call":
                 name, args, kwargs = data
                 if name in ["reset", "step", "seed", "close"]:

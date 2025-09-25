@@ -36,6 +36,7 @@ from typing import Optional
 from gymnasium import spaces
 import numpy as np
 from collections import defaultdict, deque
+from typing import Any, Dict, List
 
 
 def stack_repeated(x, n):
@@ -54,6 +55,9 @@ def repeated_box(box_space, n):
 def repeated_space(space, n):
     if isinstance(space, spaces.Box):
         return repeated_box(space, n)
+    elif isinstance(space, spaces.Text):
+        # Text spaces don't need to be repeated (they're not stackable)
+        return space
     elif isinstance(space, spaces.Dict):
         result_space = spaces.Dict()
         for key, value in space.items():
@@ -107,15 +111,15 @@ def stack_last_n_obs(all_obs, n_steps):
 class MultiStep(gym.Wrapper):
     def __init__(
         self,
-        env,
-        n_obs_steps=1,
-        n_action_steps=1,
-        max_episode_steps=None,
-        reward_agg_method="sum",  # never use other types
-        prev_action=True,
-        reset_within_step=False,
-        pass_full_observations=False,
-        verbose=False,
+        env: gym.Env,
+        n_obs_steps: int = 1,
+        n_action_steps: int = 1,
+        max_episode_steps: Optional[int] = None,
+        reward_agg_method: str = "sum",
+        prev_action: bool = True,
+        reset_within_step: bool = False,
+        pass_full_observations: bool = False,
+        verbose: bool = False,
         **kwargs,
     ):
         super().__init__(env)
@@ -130,19 +134,18 @@ class MultiStep(gym.Wrapper):
         self.reset_within_step = reset_within_step
         self.pass_full_observations = pass_full_observations
         self.verbose = verbose
+        self.last_options = None
 
+    # ###################### resetメソッドを修正 ######################
     def reset(
         self,
+        *,
         seed: Optional[int] = None,
-        return_info: bool = False,
-        options: dict = {},
-    ):
-        """Resets the environment."""
-        obs = self.env.reset(
-            seed=seed,
-            options=options,
-            return_info=return_info,
-        )
+        options: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Any, Dict[str, Any]]:
+        """Resets the environment to a starting state."""
+        super().reset(seed=seed)
+        obs, info = self.env.reset(seed=seed, options=options)
         self.obs = deque([obs], maxlen=max(self.n_obs_steps + 1, self.n_action_steps))
         if self.prev_action:
             self.action = deque(
@@ -151,81 +154,65 @@ class MultiStep(gym.Wrapper):
         self.reward = list()
         self.done = list()
         self.info = defaultdict(lambda: deque(maxlen=self.n_obs_steps + 1))
-        obs = self._get_obs(self.n_obs_steps)
-
+        self._add_info(info)
+        processed_obs = self._get_obs(self.n_obs_steps)
         self.cnt = 0
-        return obs
+        processed_info = dict_take_last_n(self.info, self.n_obs_steps)
+        self.last_options = options
+        return processed_obs, processed_info
 
-    def step(self, action):
-        """
-        actions: (n_action_steps,) + action_shape
-        """
-        if action.ndim == 1:  # in case action_steps = 1
+    def step(self, action: np.ndarray) -> tuple[Any, float, bool, bool, Dict[str, Any]]:
+        """Run one timestep of the environment's dynamics."""
+        if action.ndim == 1:
             action = action[None]
-        truncated = False
-        terminated = False
+        episode_terminated = False
+        episode_truncated = False
         for act_step, act in enumerate(action):
             self.cnt += 1
-            if terminated or truncated:
+            if episode_terminated or episode_truncated:
                 break
-            
-            # done does not differentiate terminal and truncation
-            observation, reward, done, info = self.env.step(act)
-
+            observation, reward, terminated, truncated, info = self.env.step(act)
             self.obs.append(observation)
             self.action.append(act)
             self.reward.append(reward)
-            
-            # in gym, timelimit wrapper is automatically used given env._spec.max_episode_steps
-            if "TimeLimit.truncated" not in info:
-                if done:
-                    terminated = True
-                elif (
-                    self.max_episode_steps is not None
-                ) and self.cnt >= self.max_episode_steps:
-                    truncated = True
-            else:
-                truncated = info["TimeLimit.truncated"]
-                terminated = done
-            done = truncated or terminated
-            self.done.append(done)
+            if terminated:
+                episode_terminated = True
+            if truncated:
+                episode_truncated = True
+            self.done.append(terminated or truncated)
             self._add_info(info)
         observation = self._get_obs(self.n_obs_steps)
         reward = aggregate(self.reward, self.reward_agg_method)
-        done = aggregate(self.done, "max") # spot any dones within action chunk 
         info = dict_take_last_n(self.info, self.n_obs_steps)
         if self.pass_full_observations:
             info["full_obs"] = self._get_obs(act_step + 1)
-
-        # In mujoco case, done can happen within the loop above
-        if self.reset_within_step and self.done[-1]:
-
-            # need to save old observation in the case of truncation only, for bootstrapping
-            if truncated:
+        if self.reset_within_step and (episode_terminated or episode_truncated):
+            if episode_truncated:
                 info["final_obs"] = observation
-
-            # reset
-            observation = (
-                self.reset()
-            )  # TODO: arguments? this cannot handle video recording right now since needs to pass in options
+            self.reset(options=self.last_options)
             self.verbose and print("Reset env within wrapper.")
-
-        # reset reward and done for next step
         self.reward = list()
         self.done = list()
-        return observation, reward, terminated, truncated, info
+        return observation, reward, episode_terminated, episode_truncated, info
 
     def _get_obs(self, n_steps=1):
         """
         Output (n_steps,) + obs_shape
         """
         assert len(self.obs) > 0
-        if isinstance(self.observation_space, spaces.Box):
+        if isinstance(self._observation_space, spaces.Box):
             return stack_last_n_obs(self.obs, n_steps)
-        elif isinstance(self.observation_space, spaces.Dict):
+        elif isinstance(self._observation_space, spaces.Dict):
             result = dict()
-            for key in self.observation_space.keys():
-                result[key] = stack_last_n_obs([obs[key] for obs in self.obs], n_steps)
+            for key in self._observation_space.keys():
+                obs_history_for_key = [obs[key] for obs in self.obs]
+                # Check if this is a text/string observation or other non-numeric data
+                if isinstance(self._observation_space[key], spaces.Text) or key in ['instruction', 'robot_type', 'scene_info']:
+                    # For text/string data, just return the latest observation (no stacking)
+                    result[key] = obs_history_for_key[-1]
+                else:
+                    # For numeric data (images, states), stack as usual
+                    result[key] = stack_last_n_obs(obs_history_for_key, n_steps)
             return result
         else:
             raise RuntimeError("Unsupported space type")
@@ -249,17 +236,11 @@ if __name__ == "__main__":
     import os
     from omegaconf import OmegaConf
     import json
-
     os.environ["MUJOCO_GL"] = "egl"
-
     cfg = OmegaConf.load("cfg/robomimic/finetune/can/ft_ppo_diffusion_mlp_img.yaml")
     shape_meta = cfg["shape_meta"]
-
-    import robomimic.utils.env_utils as EnvUtils
-    import robomimic.utils.obs_utils as ObsUtils
+    from env.gym_utils.wrapper.simplerenv_image import SimplerEnvImageWrapper
     import matplotlib.pyplot as plt
-    from env.gym_utils.wrapper.robomimic_image import RobomimicImageWrapper
-
     wrappers = cfg.env.wrappers
     obs_modality_dict = {
         "low_dim": (
@@ -275,31 +256,24 @@ if __name__ == "__main__":
     }
     if obs_modality_dict["rgb"] is None:
         obs_modality_dict.pop("rgb")
-    ObsUtils.initialize_obs_modality_mapping_from_dict(obs_modality_dict)
-
     with open(cfg.robomimic_env_cfg_path, "r") as f:
         env_meta = json.load(f)
-    env = EnvUtils.create_env_from_metadata(
-        env_meta=env_meta,
-        render=False,
-        render_offscreen=False,
-        use_image_obs=True,
-    )
-    env.env.hard_reset = False
-
     wrapper = MultiStep(
-        env=RobomimicImageWrapper(
-            env=env,
-            shape_meta=shape_meta,
-            image_keys=["robot0_eye_in_hand_image"],
+            env=SimplerEnvImageWrapper(
+            env_name="GraspSingleRandomObjectInScene-v0",
+            scene_name="google_pick_coke_can_1_v4", 
+            robot_type="google_robot",
+            enable_random_scene=False,
+            max_episode_steps=50
         ),
         n_obs_steps=1,
         n_action_steps=1,
     )
     wrapper.seed(0)
-    obs = wrapper.reset()
+    obs, _ = wrapper.reset()
     print(obs.keys())
-    img = wrapper.render()
+    print("obs['rgb']:", obs['rgb'].shape)
+    # img = wrapper.render()
     wrapper.close()
-    plt.imshow(img)
-    plt.savefig("test.png")
+    # plt.imshow(img)
+    # plt.savefig("test.png")

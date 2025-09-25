@@ -100,7 +100,6 @@ class SyncVectorEnv(VectorEnv):
         self._actions = None
 
     def seed(self, seed=None):
-        super().seed(seed=seed)
         if seed is None:
             seed = [None for _ in range(self.num_envs)]
         if isinstance(seed, int):

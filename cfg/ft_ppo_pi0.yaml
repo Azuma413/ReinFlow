@@ -7,7 +7,7 @@ cond_steps: 1
 img_cond_steps: 1
 
 action_dim: 7
-horizon_steps: 10
+horizon_steps: 50
 act_steps: 10
 ################################
 defaults:
@@ -18,21 +18,23 @@ hydra:
 _target_: agent.finetune.reinflow.train_ppo_pi0_agent.TrainPPOPi0Agent
 name: ${env_name}_ft_pi0_img_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}_seed${seed}
 logdir: ${oc.env:REINFLOW_LOG_DIR}/simplerenv/finetune/${env_name}_ft_pi0_img_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
-pi0_policy_path: weights/openpi/openpi0-fractal-lora  # Path to pre-trained PI0 checkpoint
-scene_name: google_pick_coke_can_1_v4
-robot_type: google_robot
+# google robot -> weights/openpi/openpi0-fractal-torch
+# widowx robot -> weights/openpi/openpi0-bridge-torch
+pi0_policy_path: weights/openpi/openpi0-bridge-torch  # Path to pre-trained PI0 checkpoint
+scene_name: bridge_table_1_v1
+robot_type: widowx
 
 seed: 42
 device: cuda:0
 #########################
-denoising_steps: 1
-ft_denoising_steps: 1
+denoising_steps: 4
+ft_denoising_steps: 4
 min_std: 0.08
-max_std: 0.14
+max_std: 0.16
 #########################
 
 env:
-  n_envs: 2 # 50
+  n_envs: 1 # 50
   name: ${env_name}
   best_reward_threshold_for_success: 1
   max_episode_steps: 300
@@ -42,14 +44,8 @@ env:
     simplerenv_image:
       scene_name: ${scene_name}
       robot_type: ${robot_type}
-      robot_variant: null
+      robot_variant: bridge_dataset  # Use bridge_dataset variant for WidowX
       enable_random_scene: true
-      env_name_pool: 
-        - "GraspSingleRandomObjectInScene-v0"
-        - "PutSpoonOnTableClothInScene-v0"
-      scene_name_pool:
-        - "google_pick_coke_can_1_v4"
-        - "bridge_table_1_v1"
       control_freq: 3
       sim_freq: 513
       max_episode_steps: ${env.max_episode_steps}
@@ -63,7 +59,7 @@ env:
 shape_meta:
   obs:
     rgb:
-      shape: [3, 256, 256]
+      shape: [3, 480, 640]
     instruction:
       shape: [128]  # Max instruction length
     state:

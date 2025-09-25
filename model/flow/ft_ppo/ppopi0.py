@@ -4,6 +4,8 @@ import copy
 import torch.nn.functional as F
 from torch import Tensor
 import logging
+import os
+import safetensors.torch
 log = logging.getLogger(__name__)
 from collections import namedtuple
 from typing import Tuple
@@ -93,11 +95,12 @@ class PPOPi0(nn.Module):
             pi05=getattr(pi0_config.model, "pi05", False),
         )
         self.pi0_policy = PI0Pytorch(model_cfg)
+        # Load PI0 weights using safetensors (following train_pytorch.py approach)
         if pi0_policy_path:
-            log.info(f"Loading PI0 policy from {pi0_policy_path}")
-            checkpoint = torch.load(pi0_policy_path, map_location=self.device)
-            self.pi0_policy.load_state_dict(checkpoint["model"])
-            log.info("Loaded PI0 policy successfully")
+            pi0_policy_path = os.path.join(pi0_policy_path, "model.safetensors")
+            safetensors.torch.load_model(self.pi0_policy, pi0_policy_path, strict=False)
+        else:
+            assert False, "PI0 policy path must be provided"
         # Freeze original policy for reference
         self.actor_old = copy.deepcopy(self.pi0_policy)
         for param in self.actor_old.parameters():
@@ -155,7 +158,7 @@ class PPOPi0(nn.Module):
         return pi0_actions
 
     def get_logprobs(self, 
-                     cond: dict, 
+                     cond, 
                      x_chain: Tensor, 
                      get_entropy=False, 
                      normalize_denoising_horizon=False, 
@@ -252,11 +255,11 @@ class PPOPi0(nn.Module):
             return logprob
 
     @torch.no_grad()
-    def get_actions(self, 
-                    cond: dict, 
-                    eval_mode: bool, 
-                    save_chains=False, 
-                    normalize_denoising_horizon=False, 
+    def get_actions(self,
+                    cond,
+                    eval_mode: bool,
+                    save_chains=False,
+                    normalize_denoising_horizon=False,
                     normalize_act_space_dimension=False,
                     clip_intermediate_actions=True,
                     account_for_initial_stochasticity=True,
@@ -266,10 +269,14 @@ class PPOPi0(nn.Module):
         Sample actions using PI0, then convert to robot actions
         Returns robot actions (7-dim) and optionally PI0 action chains (32-dim)
         """
-        B = cond["rgb"].shape[0]  # Use rgb instead of state for PI0
+        # Get batch size from images
+        if hasattr(cond, "images") and "base_0_rgb" in cond.images:
+            B = cond.images["base_0_rgb"].shape[0]
+        else:
+            # Fallback to state if images not available
+            B = cond.state.shape[0]
         dt = (1/self.inference_steps) * torch.ones(B, self.horizon_steps, self.pi0_action_dim, device=self.device)
         steps = torch.linspace(0, 1-1/self.inference_steps, self.inference_steps).repeat(B, 1).to(self.device)
-        
         if save_chains:
             x_chain = torch.zeros((B, self.inference_steps+1, self.horizon_steps, self.pi0_action_dim), device=self.device)
         if ret_logprob:
@@ -277,7 +284,6 @@ class PPOPi0(nn.Module):
             log_prob_steps = 0
             if self.logprob_debug_sample:
                 log_prob_list = []
-        
         # Sample first point (32-dim)
         xt, log_prob_init = self.sample_first_point(B)
         if ret_logprob and account_for_initial_stochasticity:
@@ -285,17 +291,14 @@ class PPOPi0(nn.Module):
             log_prob_steps += 1
             if self.logprob_debug_sample:
                 log_prob_list.append(log_prob_init.mean().item())
-        
         if save_chains:
             x_chain[:, 0] = xt
-        
         for i in range(self.inference_steps):
             t = steps[:, i]
             vt, nt = self.actor_ft.forward(xt, t, cond, learn_exploration_noise=False, step=i)
             xt += vt * dt
             if clip_intermediate_actions:
                 xt = xt.clamp(-self.denoised_clip_value, self.denoised_clip_value)
-            
             # Add noise during training
             std = nt.unsqueeze(-1).reshape(xt.shape)
             std = torch.clamp(std, min=self.min_sampling_denoising_std)
@@ -303,26 +306,21 @@ class PPOPi0(nn.Module):
             if not eval_mode:
                 xt = dist.sample().clamp_(dist.loc - self.randn_clip_value * dist.scale,
                                          dist.loc + self.randn_clip_value * dist.scale).to(self.device)
-            
             # Prevent last action overflow - convert to robot action space for clipping
             if i == self.inference_steps - 1:
                 robot_actions = self.convert_pi0_to_robot_actions(xt)
                 robot_actions = robot_actions.clamp_(self.act_min, self.act_max)
                 xt[:, :, :self.action_dim] = robot_actions  # Update first 7 dims
-            
             if ret_logprob:
                 logprob_transition = dist.log_prob(xt).sum(dim=(-2, -1)).to(self.device)
                 if self.logprob_debug_sample:
                     log_prob_list.append(logprob_transition.mean().item())
                 log_prob += logprob_transition
                 log_prob_steps += 1
-                
             if save_chains:
                 x_chain[:, i+1] = xt
-        
         # Convert final actions from PI0 (32-dim) to robot (7-dim)
         robot_actions = self.convert_pi0_to_robot_actions(xt)
-        
         if ret_logprob:
             if normalize_denoising_horizon:
                 log_prob = log_prob / log_prob_steps
@@ -331,7 +329,6 @@ class PPOPi0(nn.Module):
             if self.logprob_debug_sample:
                 transform_logprob = torch.log(1-torch.tanh(x_chain[:, -1])**2+1e-7).sum(dim=(-2,-1)).mean().item()
                 print(f"log_prob_list={log_prob_list}, transform={transform_logprob}")
-        
         if ret_logprob:
             if save_chains:
                 return (robot_actions, x_chain, log_prob)  # robot actions + PI0 chains
@@ -341,21 +338,22 @@ class PPOPi0(nn.Module):
                 return (robot_actions, x_chain)
             return robot_actions
 
-    def loss(self,
-             obs,
-             chains,  # PI0 action chains (32-dim)
-             returns,
-             oldvalues,
-             advantages,
-             oldlogprobs,
-             use_bc_loss=False,
-             bc_loss_type='W2',
-             normalize_denoising_horizon=False,
-             normalize_act_space_dimension=False,
-             verbose=True,
-             clip_intermediate_actions=True,
-             account_for_initial_stochasticity=True
-             ):
+    def loss(
+        self,
+        obs,
+        chains,  # PI0 action chains (32-dim)
+        returns,
+        oldvalues,
+        advantages,
+        oldlogprobs,
+        use_bc_loss=False,
+        bc_loss_type='W2',
+        normalize_denoising_horizon=False,
+        normalize_act_space_dimension=False,
+        verbose=True,
+        clip_intermediate_actions=True,
+        account_for_initial_stochasticity=True
+    ):
         """
         PPO loss for PI0
         chains: (B, K+1, Ta, 32)  # PI0 action chains
@@ -371,10 +369,8 @@ class PPOPi0(nn.Module):
         if verbose:
             log.info(f"oldlogprobs.min={oldlogprobs.min():5.3f}, max={oldlogprobs.max():5.3f}, std of oldlogprobs={oldlogprobs.std():5.3f}")
             log.info(f"newlogprobs.min={newlogprobs.min():5.3f}, max={newlogprobs.max():5.3f}, std of newlogprobs={newlogprobs.std():5.3f}")
-        
         newlogprobs = newlogprobs.clamp(min=self.logprob_min, max=self.logprob_max)
         oldlogprobs = oldlogprobs.clamp(min=self.logprob_min, max=self.logprob_max)
-        
         if verbose:
             if oldlogprobs.min() < self.logprob_min: 
                 log.info(f"WARNING: old logprobs too low, potential policy collapse detected")
@@ -384,7 +380,6 @@ class PPOPi0(nn.Module):
                 log.info(f"WARNING: new logprobs too high")
             if oldlogprobs.max() > self.logprob_max: 
                 log.info(f"WARNING: old logprobs too high")
-        
         # Batch normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         if verbose:
@@ -398,11 +393,9 @@ class PPOPi0(nn.Module):
                 log.info(f"Advantage stats: {advantage_stats}")
                 corr = torch.corrcoef(torch.stack([advantages, returns]))[0, 1].item()
                 log.info(f"Advantage-Reward Correlation: {corr:.2f}")
-        
         # Get ratio
         logratio = newlogprobs - oldlogprobs
         ratio = logratio.exp()
-        
         # Get KL difference and whether value clipped
         with torch.no_grad():
             approx_kl = ((ratio - 1) - logratio).mean()
