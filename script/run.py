@@ -140,4 +140,5 @@ def main(cfg: OmegaConf):
 
 
 if __name__ == "__main__":
-    main()
+    config_path = os.path.join(os.getcwd(), "cfg", "ft_ppo_pi0.yaml")
+    main(config_path=config_path)

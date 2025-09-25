@@ -174,3 +174,5 @@ dmypy.json
 cfg/robomimic/*.sh
 
 *.out
+
+uv.lock

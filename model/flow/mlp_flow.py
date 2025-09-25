@@ -161,8 +161,7 @@ class FlowMLP(nn.Module):
         if save_chains:
             return x_hat, x_chain
         return x_hat
-    
-    
+
 class ExploreNoiseNet(nn.Module):
     '''
     Neural network to generate learnable exploration noise, conditioned on time embeddings and or state embeddings. 
@@ -213,7 +212,6 @@ class ExploreNoiseNet(nn.Module):
         noise_std = torch.exp(0.5 * noise_logvar)
         return noise_std
 
-
 class NoisyFlowMLP(nn.Module):
     def __init__(
         self,
@@ -229,7 +227,7 @@ class NoisyFlowMLP(nn.Module):
         device,
         noise_hidden_dims=None,
         activation_type='Tanh'
-    ):  
+    ):
         super().__init__()
         self.device=device
         self.policy:FlowMLP = policy.to(self.device)
@@ -237,7 +235,6 @@ class NoisyFlowMLP(nn.Module):
         input:  [batchsize, time_dim + cond_enc_dim]
         output: positive tensor of shape [batchsize, self.denoising_steps, self.horizon_steps x self.act_dim]
         """
-        
         self.denoising_steps: int = denoising_steps
         self.learn_explore_noise_from: int = learn_explore_noise_from
         self.initial_noise_scheduler_type: str = inital_noise_scheduler_type
@@ -552,7 +549,6 @@ class VisionFlowMLP(nn.Module):
             return vel.view(B, Ta, Da), time_emb, cond_encoded
         return vel.view(B, Ta, Da)
 
-
 class NoisyVisionFlowMLP(NoisyFlowMLP):
     def __init__(
             self,
@@ -628,4 +624,3 @@ class NoisyVisionFlowMLP(NoisyFlowMLP):
             noise_std = self.explore_noise_net.forward(noise_feature=noise_feature)
         
         return vel, noise_std if learn_exploration_noise else noise_std.detach()
-    
