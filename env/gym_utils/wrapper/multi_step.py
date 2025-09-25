@@ -31,9 +31,9 @@ https://github.com/real-stanford/diffusion_policy/blob/main/diffusion_policy/gym
 TODO: allow cond_steps != img_cond_steps (should be implemented in training scripts, not here)
 """
 
-import gym
+import gymnasium as gym
 from typing import Optional
-from gym import spaces
+from gymnasium import spaces
 import numpy as np
 from collections import defaultdict, deque
 

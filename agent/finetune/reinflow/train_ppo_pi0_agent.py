@@ -1,0 +1,481 @@
+# MIT License
+
+# Copyright (c) 2025 ReinFlow Authors
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""
+PPO fine-tuning for PI0 policy on SimplerEnv.
+"""
+from tqdm import tqdm as tqdm
+import torch
+import logging
+import numpy as np
+from typing import Dict, Any
+from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
+
+from agent.finetune.reinflow.train_ppo_flow_img_agent import TrainPPOImgFlowAgent
+from model.common.modules import RandomShiftsAug
+from model.flow.ft_ppo.ppopi0 import PPOPi0
+from agent.finetune.reinflow.buffer import PPOFlowImgBuffer, PPOFlowImgBufferGPU
+
+# Import PI0 preprocessing utilities
+import openpi_Azuma413.src.openpi.models_pytorch.preprocessing_pytorch as pi0_preprocessing
+
+
+@dataclass
+class PI0ObservationBatch:
+    """Batch of observations in PI0 format"""
+    images: Dict[str, torch.Tensor]
+    image_masks: Dict[str, torch.Tensor] 
+    tokenized_prompt: torch.Tensor
+    tokenized_prompt_mask: torch.Tensor
+    state: torch.Tensor
+
+
+class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
+    def __init__(self, cfg):
+        # Initialize parent class but we'll override most methods
+        super().__init__(cfg)
+        
+        # PI0 specific parameters
+        self.pi0_config = cfg.model.pi0_config
+        self.pi0_policy_path = cfg.model.get('pi0_policy_path', None)
+        self.pi0_action_dim = 32  # PI0's native action dimension
+        self.robot_action_dim = cfg.model.act_dim  # Robot action dimension (7)
+        
+        # Override some settings for PI0
+        self.initial_ratio_error_threshold = 1e-4  # More relaxed for PI0
+        
+        # PI0 observation processing setup
+        self.instruction_tokenizer = None  # Will be initialized if needed
+        
+        log.info(f"Initialized PI0 training agent with robot_action_dim={self.robot_action_dim}, pi0_action_dim={self.pi0_action_dim}")
+
+    def convert_simplerenv_to_pi0_observation(self, simplerenv_obs: Dict) -> PI0ObservationBatch:
+        """
+        Convert SimplerEnv observation format to PI0 format
+        
+        SimplerEnv obs format:
+        - "rgb": image data [B, C, H, W]
+        - "instruction": language instruction string
+        - "robot_type": robot type
+        - "scene_info": scene information
+        
+        PI0 obs format:
+        - images: Dict[str, Tensor] - image data
+        - image_masks: Dict[str, Tensor] - image masks  
+        - tokenized_prompt: Tensor - tokenized language prompts
+        - tokenized_prompt_mask: Tensor - prompt masks
+        - state: Tensor - state information
+        """
+        batch_size = simplerenv_obs["rgb"].shape[0]
+        device = simplerenv_obs["rgb"].device
+        
+        # Process images
+        rgb_images = simplerenv_obs["rgb"]  # [B, C, H, W]
+        
+        # Create image dictionary (PI0 expects named images)
+        images = {"image": rgb_images}
+        
+        # Create image masks (all True since we have valid images)
+        image_masks = {"image": torch.ones(batch_size, dtype=torch.bool, device=device)}
+        
+        # Process instructions
+        if isinstance(simplerenv_obs["instruction"], (list, tuple)):
+            instructions = simplerenv_obs["instruction"]
+        else:
+            # Single instruction repeated for batch
+            instructions = [simplerenv_obs["instruction"]] * batch_size
+        
+        # Tokenize instructions (simplified tokenization for now)
+        # In practice, you might want to use PI0's tokenizer
+        max_prompt_length = 128  # Adjust based on PI0's requirements
+        tokenized_prompts = []
+        prompt_masks = []
+        
+        for instruction in instructions:
+            # Simple tokenization (you might want to use proper tokenizer)
+            if isinstance(instruction, str):
+                # Convert string to token IDs (placeholder implementation)
+                # In practice, use PI0's tokenizer
+                tokens = torch.randint(1, 1000, (max_prompt_length,), dtype=torch.long, device=device)
+                mask = torch.ones(max_prompt_length, dtype=torch.bool, device=device)
+            else:
+                # Assume already tokenized
+                tokens = torch.tensor(instruction, dtype=torch.long, device=device)
+                mask = torch.ones(len(tokens), dtype=torch.bool, device=device)
+                
+            tokenized_prompts.append(tokens)
+            prompt_masks.append(mask)
+        
+        tokenized_prompt = torch.stack(tokenized_prompts)  # [B, max_length]
+        tokenized_prompt_mask = torch.stack(prompt_masks)  # [B, max_length]
+        
+        # Create state tensor (use dummy state for now since SimplerEnv might not provide it)
+        # You might need to extract robot state from the environment
+        state_dim = 32  # PI0's expected state dimension
+        state = torch.zeros(batch_size, state_dim, dtype=torch.float32, device=device)
+        
+        return PI0ObservationBatch(
+            images=images,
+            image_masks=image_masks,
+            tokenized_prompt=tokenized_prompt,
+            tokenized_prompt_mask=tokenized_prompt_mask,
+            state=state
+        )
+
+    def pi0_observation_to_dict(self, pi0_obs: PI0ObservationBatch) -> Dict:
+        """Convert PI0ObservationBatch to dictionary format expected by model"""
+        return {
+            "images": pi0_obs.images,
+            "image_masks": pi0_obs.image_masks,
+            "tokenized_prompt": pi0_obs.tokenized_prompt,
+            "tokenized_prompt_mask": pi0_obs.tokenized_prompt_mask,
+            "state": pi0_obs.state
+        }
+
+    def init_buffer(self):
+        """Initialize buffer for PI0 training"""
+        log.info(f"self.buffer_device={self.buffer_device}")
+        log_prob_cfg_dict = {
+            'normalize_denoising_horizon': self.normalize_denoising_horizon,
+            'normalize_act_space_dimension': self.normalize_act_space_dim, 
+            'clip_intermediate_actions': self.clip_intermediate_actions,
+            'account_for_initial_stochasticity': self.account_for_initial_stochasticity
+        }       
+        
+        # Set observation dimensions for PI0
+        # We need to store both SimplerEnv obs and PI0 obs
+        obs_dims = {
+            "rgb": self.obs_dims["rgb"],  # Image observations from SimplerEnv
+            "instruction": (1,),  # Placeholder for instruction (we'll handle separately)
+            "robot_type": (1,),   # Placeholder for robot type
+        }
+        
+        if self.buffer_device == 'cpu':
+            self.buffer = PPOFlowImgBuffer(
+                n_steps=self.n_steps,
+                n_envs=self.n_envs,
+                n_ft_denoising_steps=self.inference_steps, 
+                horizon_steps=self.horizon_steps,
+                act_steps=self.act_steps,
+                action_dim=self.pi0_action_dim,  # Use PI0 action dimension for chains
+                n_cond_step=self.n_cond_step,
+                obs_dim=obs_dims,
+                save_full_observation=self.save_full_observations,
+                furniture_sparse_reward=self.furniture_sparse_reward,
+                best_reward_threshold_for_success=self.best_reward_threshold_for_success,
+                reward_scale_running=self.reward_scale_running,
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+                reward_scale_const=self.reward_scale_const,
+                aug=self.aug if hasattr(self, 'aug') else None,
+                fix_nextvalue_augment_bug=self.fix_nextvalue_augment_bug,
+                device=self.device,
+                log_prob_cfg_dict=log_prob_cfg_dict
+            )
+        else:
+            self.buffer = PPOFlowImgBufferGPU(
+                n_steps=self.n_steps,
+                n_envs=self.n_envs,
+                n_ft_denoising_steps=self.inference_steps, 
+                horizon_steps=self.horizon_steps,
+                act_steps=self.act_steps,
+                action_dim=self.pi0_action_dim,  # Use PI0 action dimension for chains
+                n_cond_step=self.n_cond_step,
+                obs_dim=obs_dims,
+                save_full_observation=self.save_full_observations,
+                furniture_sparse_reward=self.furniture_sparse_reward,
+                best_reward_threshold_for_success=self.best_reward_threshold_for_success,
+                reward_scale_running=self.reward_scale_running,
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+                reward_scale_const=self.reward_scale_const,
+                aug=self.aug if hasattr(self, 'aug') else None,
+                fix_nextvalue_augment_bug=self.fix_nextvalue_augment_bug,
+                device=self.device,
+                log_prob_cfg_dict=log_prob_cfg_dict
+            )
+        log.info(f"created buffer: {self.buffer.__class__} on {self.buffer_device}")
+
+    @torch.no_grad()
+    def get_samples(self, 
+                    cond: dict, 
+                    ret_device='cpu', 
+                    save_chains=True, 
+                    normalize_denoising_horizon=False, 
+                    normalize_act_space_dimension=False, 
+                    clip_intermediate_actions=True,
+                    account_for_initial_stochasticity=True):
+        """
+        Get action samples from PI0 model
+        Returns robot actions (7-dim) and PI0 action chains (32-dim)
+        """
+        if save_chains:
+            robot_actions, pi0_chains = self.model.get_actions(
+                cond, 
+                eval_mode=self.eval_mode, 
+                save_chains=save_chains, 
+                normalize_denoising_horizon=normalize_denoising_horizon, 
+                normalize_act_space_dimension=normalize_act_space_dimension, 
+                clip_intermediate_actions=clip_intermediate_actions,
+                account_for_initial_stochasticity=account_for_initial_stochasticity,
+                ret_logprob=False
+            )
+            robot_actions_np = robot_actions.cpu().numpy() if ret_device == 'cpu' else robot_actions
+            pi0_chains_out = pi0_chains.cpu().numpy() if ret_device == 'cpu' else pi0_chains
+            return robot_actions_np, pi0_chains_out
+        else:
+            robot_actions = self.model.get_actions(
+                cond, 
+                eval_mode=self.eval_mode, 
+                save_chains=save_chains, 
+                normalize_denoising_horizon=normalize_denoising_horizon, 
+                normalize_act_space_dimension=normalize_act_space_dimension, 
+                clip_intermediate_actions=clip_intermediate_actions,
+                account_for_initial_stochasticity=account_for_initial_stochasticity,
+                ret_logprob=False
+            )
+            return robot_actions.cpu().numpy()
+
+    def run(self):
+        """Main training loop for PI0"""
+        self.init_buffer()
+        self.prepare_run()
+        self.buffer.reset()
+        
+        if self.resume:
+            self.resume_training()
+            
+        while self.itr < self.n_train_itr:
+            self.prepare_video_path()
+            self.set_model_mode()
+            self.reset_env(buffer_device=self.buffer_device)
+            self.buffer.update_full_obs()
+            
+            for step in tqdm(range(self.n_steps)) if self.verbose else range(self.n_steps):
+                if not self.verbose and step % 100 == 0: 
+                    print(f"Processed {step} of {self.n_steps}")
+                    
+                with torch.no_grad():
+                    # Convert SimplerEnv observation to PI0 format
+                    pi0_obs_batch = self.convert_simplerenv_to_pi0_observation(self.prev_obs_venv)
+                    pi0_cond = self.pi0_observation_to_dict(pi0_obs_batch)
+                    
+                    # Get actions (robot actions + PI0 chains)
+                    robot_actions, pi0_chains = self.get_samples(
+                        cond=pi0_cond, 
+                        ret_device=self.buffer_device,
+                        normalize_denoising_horizon=self.normalize_denoising_horizon,
+                        normalize_act_space_dimension=self.normalize_act_space_dim, 
+                        clip_intermediate_actions=self.clip_intermediate_actions,
+                        account_for_initial_stochasticity=self.account_for_initial_stochasticity
+                    )
+                
+                # Apply multi-step action (use robot actions for environment)
+                action_venv = robot_actions[:, :self.act_steps]  # [n_envs, act_steps, 7]
+                obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = self.venv.step(action_venv)
+                
+                # Store in buffer (store PI0 chains for training)
+                self.buffer.add(step, self.prev_obs_venv, pi0_chains, reward_venv, terminated_venv, truncated_venv)
+                
+                self.prev_obs_venv = obs_venv
+                self.cnt_train_step += self.n_envs * self.act_steps if not self.eval_mode else 0
+            
+            self.buffer.summarize_episode_reward()
+            
+            if not self.eval_mode:
+                # Update buffer with final observations
+                self.buffer.update_img(obs_venv, self.model)
+                self.agent_update(verbose=self.verbose)
+            
+            self.log()
+            self.update_lr()
+            self.adjust_finetune_schedule()
+            self.save_model()
+                              
+            self.itr += 1
+            
+            # Early stopping
+            if self.use_early_stop and (self.buffer.success_rate < 0.05 or self.buffer.avg_episode_reward < 2.0):
+                log.info(f"Your finetuning failed. success_rate={self.buffer.success_rate*100:.2f}% and avg_episode_reward={self.buffer.avg_episode_reward:.2f}")
+                exit()
+            
+            self.clear_cache()
+            self.inspect_memory()
+
+    def agent_update(self, verbose=True):
+        """Agent update for PI0 training"""
+        clipfracs_list = []
+        noise_std_list = []
+        actor_norm = 0.0
+        critic_norm = 0.0
+        
+        for update_epoch, batch_id, minibatch in self.minibatch_generator() if not self.repeat_samples else self.minibatch_generator_repeat():
+            
+            # Minibatch gradient descent
+            self.model: PPOPi0
+            
+            # Convert observations to PI0 format for loss calculation
+            obs_dict, pi0_chains, returns, oldvalues, advantages, oldlogprobs = minibatch
+            
+            # Convert SimplerEnv observations to PI0 format
+            pi0_obs_batch = self.convert_simplerenv_to_pi0_observation(obs_dict)
+            pi0_obs_dict = self.pi0_observation_to_dict(pi0_obs_batch)
+            
+            pg_loss, entropy_loss, v_loss, bc_loss, \
+            clipfrac, approx_kl, ratio, \
+            oldlogprob_min, oldlogprob_max, oldlogprob_std, \
+            newlogprob_min, newlogprob_max, newlogprob_std, \
+            noise_std, newQ_values = self.model.loss(
+                pi0_obs_dict,  # Use PI0 format observations
+                pi0_chains,    # PI0 action chains (32-dim)
+                returns, 
+                oldvalues, 
+                advantages, 
+                oldlogprobs, 
+                use_bc_loss=self.use_bc_loss, 
+                bc_loss_type=self.bc_loss_type, 
+                normalize_denoising_horizon=self.normalize_denoising_horizon, 
+                normalize_act_space_dimension=self.normalize_act_space_dim,
+                verbose=verbose,
+                clip_intermediate_actions=self.clip_intermediate_actions,
+                account_for_initial_stochasticity=self.account_for_initial_stochasticity
+            )
+            
+            self.approx_kl = approx_kl
+            if verbose:
+                log.info(f"update_epoch={update_epoch}/{self.update_epochs}, batch_id={batch_id}/{max(1, self.total_steps // self.batch_size)}, ratio={ratio:.3f}, clipfrac={clipfrac:.3f}, approx_kl={self.approx_kl:.2e}")
+            
+            if update_epoch == 0 and batch_id == 0 and np.abs(ratio - 1.00) > self.initial_ratio_error_threshold:
+                log.info(f"Warning: ratio={ratio} not 1.00 when update_epoch ==0  and batch_id ==0, there must be some bugs in your code not related to hyperparameters!")
+            
+            if self.target_kl and self.lr_schedule == 'adaptive_kl':
+                self.update_lr_adaptive_kl(self.approx_kl)
+            
+            loss = pg_loss + entropy_loss * self.ent_coef + v_loss * self.vf_coef + bc_loss * self.bc_coeff
+            
+            clipfracs_list += [clipfrac]
+            noise_std_list += [noise_std]
+            
+            loss.backward()
+            
+            # Gradient accumulation support
+            if (batch_id + 1) % self.grad_accumulate == 0:
+                # Debug the losses
+                actor_norm = torch.nn.utils.clip_grad_norm_(self.model.actor_ft.parameters(), max_norm=float('inf'))
+                critic_norm = torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=float('inf'))
+                if verbose:
+                    log.info(f"before clipping: actor_norm={actor_norm:.2e}, critic_norm={critic_norm:.2e}")
+                
+                # Update actor: after critic warmup update the actor less frequently but more times. 
+                if self.itr >= self.n_critic_warmup_itr:
+                    if self.max_grad_norm:
+                        torch.nn.utils.clip_grad_norm_(self.model.actor_ft.parameters(), self.max_grad_norm)
+                    self.actor_optimizer.step()
+                    
+                # Update critic
+                if self.max_grad_norm:
+                    torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), self.max_grad_norm)
+                self.critic_optimizer.step()
+                
+                # Release gradient accumulation
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+                
+                # Report
+                log.info(f"run grad update at batch {batch_id}")
+                log.info(f"approx_kl: {approx_kl}, update_epoch: {update_epoch}/{self.update_epochs}, num_batch: {self.total_steps //self.batch_size}")
+        
+        clip_fracs = np.mean(clipfracs_list)
+        noise_stds = np.mean(noise_std_list)
+        
+        self.train_ret_dict = {
+            "loss": loss,
+            "pg loss": pg_loss,
+            "value loss": v_loss,
+            "entropy_loss": entropy_loss,
+            "bc_loss": bc_loss,
+            "approx kl": self.approx_kl,
+            "ratio": ratio,
+            "clipfrac": clip_fracs,
+            "explained variance": self.explained_var,
+            "old_logprob_min": oldlogprob_min,
+            "old_logprob_max": oldlogprob_max,
+            "old_logprob_std": oldlogprob_std,
+            "new_logprob_min": newlogprob_min,
+            "new_logprob_max": newlogprob_max,
+            "new_logprob_std": newlogprob_std,
+            "actor_norm": actor_norm,
+            "critic_norm": critic_norm,
+            "actor lr": self.actor_optimizer.param_groups[0]["lr"],
+            "critic lr": self.critic_optimizer.param_groups[0]["lr"],
+            "min_logprob_noise_std": self.model.min_logprob_denoising_std,
+            "min_sampling_noise_std": self.model.min_sampling_denoising_std,
+            "noise_std": noise_stds,
+            "Q_values": self.Q_values
+        }
+
+    def minibatch_generator_repeat(self):
+        """Generate minibatches for PI0 training"""
+        self.approx_kl = 0.0
+        
+        obs, chains, returns, oldvalues, advantages, oldlogprobs = self.buffer.make_dataset()
+        
+        # Explained variation of future rewards using value function
+        self.explained_var = self.buffer.get_explained_var(oldvalues, returns)
+        self.Q_values = oldvalues.mean().item()
+        
+        duplicate_multiplier = self.minibatch_duplicate_multiplier 
+        self.total_steps = self.n_steps * self.n_envs * duplicate_multiplier
+        
+        for update_epoch in range(self.update_epochs):
+            self.kl_change_too_much = False
+            indices = torch.randperm(self.total_steps, device=self.device)
+            if self.lr_schedule == 'fixed' and self.kl_change_too_much:
+                break
+                
+            for batch_id, start in enumerate(range(0, self.total_steps, self.batch_size)):
+                end = start + self.batch_size
+                inds_b = indices[start:end]
+                batch_inds_b, denoising_inds_b = torch.unravel_index(
+                    inds_b,
+                    (self.n_steps * self.n_envs, duplicate_multiplier),
+                )
+                minibatch = (
+                    {k: obs[k][batch_inds_b] for k in obs},  # SimplerEnv observations
+                    chains[batch_inds_b],  # PI0 action chains (32-dim)
+                    returns[batch_inds_b], 
+                    oldvalues[batch_inds_b],
+                    advantages[batch_inds_b],
+                    oldlogprobs[batch_inds_b] 
+                )
+                
+                if (self.lr_schedule == 'fixed' 
+                    and self.target_kl 
+                    and self.approx_kl > self.target_kl
+                    and self.itr >= self.n_critic_warmup_itr):
+                    self.kl_change_too_much = True
+                    log.warning(f"KL change too much, approx_kl ={self.approx_kl} > {self.target_kl} = target_kl, stop optimization.")
+                    break
+                
+                yield update_epoch, batch_id, minibatch

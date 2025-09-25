@@ -31,8 +31,8 @@ from util.dirs import REINFLOW_DIR
 clean_pycache(directory=REINFLOW_DIR)
 
 # register kitchen tasks in advance. prevent env not found error. 
-import gym
-import d4rl.gym_mujoco
+import gymnasium as gym
+# import d4rl.gym_mujoco
 
 import gc
 gc.collect()
@@ -71,7 +71,7 @@ sys.stderr = open(sys.stderr.fileno(), mode="w", buffering=1)
 def main(cfg: OmegaConf):
     # resolve immediately so all the ${now:} resolvers will use the same time.
     OmegaConf.resolve(cfg)
-    
+
     # ReinFlow Authors: Set rendering backend from config file.
     sim_device = cfg.get('sim_device', None)
     if sim_device is not None:
@@ -127,12 +127,40 @@ def main(cfg: OmegaConf):
         log.info(f"Downloading checkpoint from {download_url} to {download_target}")
         gdown.download(url=download_url, output=download_target, fuzzy=True)
 
+    # For PI0: download PI0 policy if needed
+    if "pi0_policy_path" in cfg and cfg.pi0_policy_path and (not os.path.exists(cfg.pi0_policy_path)):
+        log.warning(f"PI0 policy path {cfg.pi0_policy_path} does not exist. Please provide a valid PI0 checkpoint or set pi0_policy_path=null to start from scratch.")
+
     # Deal with isaacgym needs to be imported before torch
     if "env" in cfg and "env_type" in cfg.env and cfg.env.env_type == "furniture":
         import furniture_bench
         # import torch
         # torch.cuda.empty_cache()
     
+    # SimplerEnv setup
+    if "env_suite" in cfg and cfg.env_suite == "simplerenv":
+        # Set MuJoCo backend for SimplerEnv
+        if 'MUJOCO_GL' not in os.environ:
+            os.environ['MUJOCO_GL'] = 'egl'
+            log.info("Set MUJOCO_GL=egl for SimplerEnv")
+        
+        # Import SimplerEnv to register environments
+        try:
+            import SimplerEnv
+            log.info("SimplerEnv imported successfully")
+        except ImportError as e:
+            log.error(f"Failed to import SimplerEnv: {e}")
+            log.error("Please make sure SimplerEnv is installed and accessible")
+
+        # Import PI0 if needed
+        if "pi0" in cfg.get("_target_", "").lower():
+            try:
+                import openpi_Azuma413.src.openpi.models_pytorch.pi0_pytorch as pi0_pytorch
+                log.info("PI0 modules imported successfully")
+            except ImportError as e:
+                log.error(f"Failed to import PI0 modules: {e}")
+                log.error("Please make sure openpi_Azuma413 is installed and accessible")
+
     # run agent
     cls = hydra.utils.get_class(cfg._target_)
     agent = cls(cfg)
@@ -140,5 +168,4 @@ def main(cfg: OmegaConf):
 
 
 if __name__ == "__main__":
-    config_path = os.path.join(os.getcwd(), "cfg", "ft_ppo_pi0.yaml")
-    main(config_path=config_path)
+    main()

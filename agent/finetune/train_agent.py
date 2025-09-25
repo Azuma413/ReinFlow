@@ -49,7 +49,8 @@ class TrainAgent:
         torch.manual_seed(self.seed)
 
         # Wandb (revised by ReinFlow authors)
-        self.use_wandb = cfg.wandb is not None
+        self.use_wandb = (cfg.wandb is not None) and (cfg.wandb.get("use_wandb", False))
+        print("Use wandb:", self.use_wandb)
         if self.use_wandb:
             # Check if offline mode is enabled (e.g., via config or environment variable)
             offline_mode = cfg.wandb.get("offline_mode", False)  # Add this to your config if desired

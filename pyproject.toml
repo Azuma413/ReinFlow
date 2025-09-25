@@ -7,7 +7,7 @@ name = "ReinFlow"
 version = "1.0.0"
 description = "Fine-tuning flow matching policies with policy gradient."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
 ]
@@ -27,7 +27,9 @@ dependencies = [
     "pypdf>=3.9.0",
     "seaborn==0.13.2",
     "mani_skill2_real2sim",
-    "openpi-client"
+    "openpi-client",
+    "transformers==4.53.2",
+    "pytest>=8.3.5",
 ]
 
 [project.optional-dependencies]
@@ -42,13 +44,6 @@ kitchen = [
     "dm_control==1.0.16",   
     "mujoco==3.1.6",
     "patchelf",
-]
-robomimic = [
-    "cython<3",
-    "d4rl",
-    "patchelf",
-    "robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git",
-    "robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git@v1.4.1",
 ]
 d3il = [
     "cython<3",
@@ -73,8 +68,6 @@ all = [
     "ipdb==0.13.13",
     "patchelf",
     "pin",
-    "robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git",
-    "robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git@v1.4.1",
 ]
 
 [project.urls]

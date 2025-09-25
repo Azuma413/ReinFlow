@@ -127,7 +127,7 @@ def make_async(
         return env
 
     # avoid import error due incompatible gym versions
-    from gym import spaces
+    from gymnasium import spaces
     from env.gym_utils.async_vector_env import AsyncVectorEnv
     from env.gym_utils.sync_vector_env import SyncVectorEnv
     from env.gym_utils.wrapper import wrapper_dict
@@ -146,104 +146,124 @@ def make_async(
         import robomimic.utils.obs_utils as ObsUtils
     elif "avoiding" in env_name:
         import gym_avoiding
-    else:
-        import d4rl.gym_mujoco
-    from gym.envs import make as make_
-    
+    # else:
+    #     import d4rl.gym_mujoco
+    from gymnasium.envs import make as make_
 
-    
     def _make_env():
-        if robomimic_env_cfg_path is not None:
-            obs_modality_dict = {
-                "low_dim": (
-                    wrappers.robomimic_image.low_dim_keys
-                    if "robomimic_image" in wrappers
-                    else wrappers.robomimic_lowdim.low_dim_keys
-                ),
-                "rgb": (
-                    wrappers.robomimic_image.image_keys
-                    if "robomimic_image" in wrappers
-                    else None
-                ),
-            }
-            if obs_modality_dict["rgb"] is None:
-                obs_modality_dict.pop("rgb")
-            ObsUtils.initialize_obs_modality_mapping_from_dict(obs_modality_dict)
-            if render_offscreen or use_image_obs:
-                os.environ[""] = "egl"
-            with open(robomimic_env_cfg_path, "r") as f:
-                env_meta = json.load(f)
-            env_meta["reward_shaping"] = reward_shaping
-            
-            print(f"Robomimic env_meta={env_meta}")
-            print(f"""Robomimic env_name={env_meta["env_name"]}""")
-            env = EnvUtils.create_env_from_metadata(
-                env_meta=env_meta,
-                render=render,
-                # only way to not show collision geometry is to enable render_offscreen, which uses a lot of RAM.
-                render_offscreen=render_offscreen,
-                use_image_obs=use_image_obs,
-                # render_gpu_device_id=0,
-            )
-            # Robosuite's hard reset causes excessive memory consumption.
-            # Disabled to run more envs.
-            # https://github.com/ARISE-Initiative/robosuite/blob/92abf5595eddb3a845cd1093703e5a3ccd01e77e/robosuite/environments/base.py#L247-L248
-            env.env.hard_reset = False
-        else:  # d3il, gym
-            if "kitchen" not in env_name:  # d4rl kitchen does not support rendering! use 
-                kwargs["render"] = render
-            
-            # print(f"environment id={id}")
-            if "Humanoid" in env_name:
-                print(f"make humanoid!")
-                env=make_('Humanoid-v3')
-            else: # gym, Franka Kitchen
-                print(f'Making gym environment id={env_name}')
-                env = make_(env_name, **kwargs)
+        mutable_wrappers = dict(wrappers) if wrappers is not None else {}
         
-        # add wrappers
-        if wrappers is not None:
-            for wrapper, args in wrappers.items():
-                env = wrapper_dict[wrapper](env, **args)
-        
-        if 'kitchen' in env_name.lower():
-            # Currently we do not support rendering for kitchen environments. 
-            pass
-            # # print(env.env.sim.model.camera_id2name) 
-            # # print(env.unwrapped.sim.model.camera_id2name) 
-            # model = env.unwrapped.sim.model
-            # for i in range(model.ncam):
-            #     name = model.id2name(i, "camera")
-            #     print(f"Camera {i}: {name}")
-            # """
-            # Camera 0: left_cap
-            # Camera 1: right_cap
-            # """
+        env = None
+        # SimplerEnvImageWrapper は特別なラッパーなので、まず処理する
+        if 'simplerenv_image' in mutable_wrappers:
+            # コピーからpopするので、元の設定オブジェクトに影響がなく安全
+            args = mutable_wrappers.pop('simplerenv_image')
+            
+            # SimplerEnvImageWrapper を直接インスタンス化
+            # (wrapper_dictに 'simplerenv_image' のキーとSimplerEnvImageWrapperクラスのペアが登録されている必要がある)
+            env = wrapper_dict['simplerenv_image'](**args)
+
+        # SimplerEnvImageWrapper が使われなかった場合、通常の環境を生成
+        if env is None:
+            if robomimic_env_cfg_path is not None:
+                obs_modality_dict = {
+                    "low_dim": (
+                        mutable_wrappers['robomimic_image'].low_dim_keys
+                        if "robomimic_image" in mutable_wrappers
+                        else mutable_wrappers['robomimic_lowdim'].low_dim_keys
+                    ),
+                    "rgb": (
+                        mutable_wrappers['robomimic_image'].image_keys
+                        if "robomimic_image" in mutable_wrappers
+                        else None
+                    ),
+                }
+                if obs_modality_dict["rgb"] is None:
+                    obs_modality_dict.pop("rgb")
+                ObsUtils.initialize_obs_modality_mapping_from_dict(obs_modality_dict)
+                if render_offscreen or use_image_obs:
+                    os.environ[""] = "egl"
+                with open(robomimic_env_cfg_path, "r") as f:
+                    env_meta = json.load(f)
+                env_meta["reward_shaping"] = reward_shaping
                 
-            # print(f"env.unwrapped.sim.render()={env.unwrapped.sim.render}")
-            # import inspect
-            # print(f"inspect.getsource(env.unwrapped.sim.render)={inspect.getsource(env.unwrapped.sim.render)}")
-            # print(f"inspect.getfile(env.unwrapped.sim.render)={inspect.getfile(env.unwrapped.sim.render)}")
-            # def get_rgb(self, width=640, height=480, camera_name="right_cap"):
-            #     try:
-            #         img = self.unwrapped.sim.render(width=width, height=height, camera_id=-1)
-            #         if img is None:
-            #             print("sim.render returned None")
-            #         return img
-            #     except Exception as e:
-            #         print(f"Error in get_rgb: {e}")
-            #         return None
-            # env.get_rgb = get_rgb.__get__(env)
-            # # test rendering
-            # os.environ['MUJOCO_GL'] = 'egl'
-            # img = env.get_rgb(width=320, height=240, camera_name='left_cap')
-            # print("DEBUG:: get_rgb() returned image with shape:", img.shape if img is not None else None)
+                print(f"Robomimic env_meta={env_meta}")
+                print(f"""Robomimic env_name={env_meta["env_name"]}""")
+                env = EnvUtils.create_env_from_metadata(
+                    env_meta=env_meta,
+                    render=render,
+                    render_offscreen=render_offscreen,
+                    use_image_obs=use_image_obs,
+                )
+                env.env.hard_reset = False
+            else:  # d3il, gym
+                if "kitchen" not in env_name:
+                    kwargs["render"] = render
+                
+                if "Humanoid" in env_name:
+                    print(f"make humanoid!")
+                    env=make_('Humanoid-v3')
+                else: # gym, Franka Kitchen
+                    print(f'Making gym environment id={env_name}')
+                    env = make_(env_name, **kwargs)
+        
+        # 残りのラッパーを適用 (mutable_wrappersには'simplerenv_image'はもう含まれていない)
+        for wrapper, args in mutable_wrappers.items():
+            env = wrapper_dict[wrapper](env, **args)
+        # if robomimic_env_cfg_path is not None:
+        #     obs_modality_dict = {
+        #         "low_dim": (
+        #             wrappers.robomimic_image.low_dim_keys
+        #             if "robomimic_image" in wrappers
+        #             else wrappers.robomimic_lowdim.low_dim_keys
+        #         ),
+        #         "rgb": (
+        #             wrappers.robomimic_image.image_keys
+        #             if "robomimic_image" in wrappers
+        #             else None
+        #         ),
+        #     }
+        #     if obs_modality_dict["rgb"] is None:
+        #         obs_modality_dict.pop("rgb")
+        #     ObsUtils.initialize_obs_modality_mapping_from_dict(obs_modality_dict)
+        #     if render_offscreen or use_image_obs:
+        #         os.environ[""] = "egl"
+        #     with open(robomimic_env_cfg_path, "r") as f:
+        #         env_meta = json.load(f)
+        #     env_meta["reward_shaping"] = reward_shaping
+        #     print(f"Robomimic env_meta={env_meta}")
+        #     print(f"""Robomimic env_name={env_meta["env_name"]}""")
+        #     env = EnvUtils.create_env_from_metadata(
+        #         env_meta=env_meta,
+        #         render=render,
+        #         # only way to not show collision geometry is to enable render_offscreen, which uses a lot of RAM.
+        #         render_offscreen=render_offscreen,
+        #         use_image_obs=use_image_obs,
+        #         # render_gpu_device_id=0,
+        #     )
+        #     env.env.hard_reset = False
+        # if wrappers is not None and "simplerenv_image" in wrappers:
+        #     print(f"Making SimplerEnv environment with wrapper: {env_name}")
+        #     wrapper_args = wrappers["simplerenv_image"]
+        #     env = wrapper_dict["simplerenv_image"](env_name=env_name, **wrapper_args)
+        # else:
+        #     if "kitchen" not in env_name:  # d4rl kitchen does not support rendering! use 
+        #         kwargs["render"] = render
+        #     if "Humanoid" in env_name:
+        #         print(f"make humanoid!")
+        #         env=make_('Humanoid-v3')
+        #     else: # gym, Franka Kitchen
+        #         print(f'Making gym environment id={env_name}')
+        #         env = make_(env_name, **kwargs)
+        # if wrappers is not None:
+        #     for wrapper, args in wrappers.items():
+        #         env = wrapper_dict[wrapper](env, **args)
         return env
 
     def dummy_env_fn():
         """TODO(allenzren): does this dummy env allow camera obs for other envs besides robomimic?"""
-        import d4rl
-        import gym
+        # import d4rl
+        import gymnasium as gym
         import numpy as np
         from env.gym_utils.wrapper.multi_step import MultiStep
 
@@ -260,6 +280,9 @@ def make_async(
                     min_value, max_value = -1, 1
                 elif key.endswith("state"):
                     min_value, max_value = -1, 1
+                elif key.endswith("instruction"):
+                    # instructionはテキストデータなので、Boxスペースの定義からスキップする
+                    continue
                 else:
                     raise RuntimeError(f"Unsupported type {key}")
                 observation_space[key] = spaces.Box(

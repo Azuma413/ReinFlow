@@ -25,7 +25,7 @@ Environment wrapper for Furniture-Bench environments.
 
 """
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from collections import deque
