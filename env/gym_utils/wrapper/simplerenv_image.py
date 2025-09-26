@@ -719,32 +719,29 @@ class SimplerEnvImageWrapper(gym.Env):
         try:
             # PI0 action format: [world_vector(3), rotation_delta(3), open_gripper(1)]
             world_vector = pi0_action[:3]
-            rotation_delta = pi0_action[3:6] 
+            rotation_delta = pi0_action[3:6]
             open_gripper = pi0_action[6] if len(pi0_action) > 6 else 0.0
-            
-            # Apply action scale (similar to pi0_or_fast.py)
-            action_scale = 1.0  # Can be made configurable
+
+            action_scale = 1.0
             world_vector = world_vector * action_scale
-            
+
             # Convert rotation delta to axis-angle format
             from transforms3d.euler import euler2axangle
             roll, pitch, yaw = rotation_delta
             action_rotation_ax, action_rotation_angle = euler2axangle(roll, pitch, yaw)
             action_rotation_axangle = action_rotation_ax * action_rotation_angle * action_scale
-            
+
             # Convert gripper action: PI0 outputs [0,1] (0=close, 1=open)
             # WidowX expects [-1,1] format
             gripper_action = 2.0 * (open_gripper > 0.5) - 1.0
-            
+
             # Combine into environment action format
             env_action = np.concatenate([
                 world_vector,           # [3] - xyz translation
                 action_rotation_axangle, # [3] - axis-angle rotation
                 [gripper_action]        # [1] - gripper
             ])
-            
             return np.clip(env_action, -1.0, 1.0).astype(np.float32)
-            
         except Exception as e:
             print(f"Error processing WidowX action: {e}")
             # Fallback: return clipped original action
@@ -794,52 +791,3 @@ class SimplerEnvImageWrapper(gym.Env):
     def get_language_instruction(self):
         """Get current language instruction"""
         return self.env.get_language_instruction()
-
-
-if __name__ == "__main__":
-    # Example usage
-    import os
-    os.environ["MUJOCO_GL"] = "egl"
-    
-    # Google Robot example
-    print("Testing Google Robot...")
-    wrapper = SimplerEnvImageWrapper(
-        env_name="GraspSingleRandomObjectInScene-v0",
-        scene_name="google_pick_coke_can_1_v4", 
-        robot_type="google_robot",
-        enable_random_scene=False,
-        max_episode_steps=50
-    )
-    
-    wrapper.seed(42)
-    obs, info = wrapper.reset()
-    print(f"Observation keys: {obs.keys()}")
-    print(f"RGB shape: {obs['rgb'].shape}")
-    print(f"State shape: {obs['state'].shape}")
-    
-    for i in range(5):
-        action = wrapper.action_space.sample()
-        obs, reward, terminated, truncated, info = wrapper.step(action)
-        print(f"Step {i}: reward={reward}, terminated={terminated}, truncated={truncated}")
-        if terminated or truncated:
-            break
-            
-    wrapper.close()
-    
-    # WidowX example
-    print("\nTesting WidowX Robot...")
-    wrapper = SimplerEnvImageWrapper(
-        env_name="PutSpoonOnTableClothInScene-v0",
-        scene_name="bridge_table_1_v1",
-        robot_type="widowx", 
-        robot_variant="bridge_dataset",
-        enable_random_scene=False,
-        max_episode_steps=50
-    )
-    wrapper.seed(42)
-    obs, info = wrapper.reset()
-    print(f"Observation keys: {obs.keys()}")
-    print(f"RGB shape: {obs['rgb'].shape}")
-    print(f"State shape: {obs['state'].shape}")
-    wrapper.close()
-    print("Test completed!")

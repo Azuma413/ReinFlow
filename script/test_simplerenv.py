@@ -274,8 +274,7 @@ class SimplerEnvTester:
                         # robot_actions: [batch_size, horizon_steps, action_dim]
                         pi0_action_chunk = robot_actions[0]  # [horizon_steps, action_dim]
                         env_action_chunk = self.env.env.postprocess_pi0_action_for_env(pi0_action_chunk)
-                        # アクションの範囲確認
-                        env_action_chunk = np.clip(env_action_chunk, -1.0, 1.0)
+                        print(f"original action: {pi0_action_chunk[0]}\nconverted action: {env_action_chunk[0]}")
                         if step_count == 0:
                             print(f"Converted action chunk shape: {env_action_chunk.shape}")
                         action_chunk = env_action_chunk[:self.config.act_steps]
@@ -362,7 +361,7 @@ def main():
         tester = SimplerEnvTester(config)
         print("Running test...")
         results = tester.run_test(
-            num_episodes=2,
+            num_episodes=10,
             max_steps_per_episode=config.env.max_episode_steps
         )
         print("Test completed successfully!")

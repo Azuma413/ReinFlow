@@ -20,9 +20,9 @@ name: ${env_name}_ft_pi0_img_ta${horizon_steps}_td${denoising_steps}_tdf${ft_den
 logdir: ${oc.env:REINFLOW_LOG_DIR}/simplerenv/finetune/${env_name}_ft_pi0_img_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
 # google_robot -> weights/openpi/openpi0-fractal-torch
 # widowx -> weights/openpi/openpi0-bridge-torch
-pi0_policy_path: weights/openpi/openpi0-bridge-torch  # Path to pre-trained PI0 checkpoint
-scene_name: bridge_table_1_v2 # bridge_table_1_v2
-robot_type: widowx # widowx | google_robot
+pi0_policy_path: weights/openpi/openpi0-fractal-torch  # Path to pre-trained PI0 checkpoint
+scene_name: google_pick_coke_can_1_v4 # bridge_table_1_v2 | google_pick_coke_can_1_v4
+robot_type: google_robot # widowx | google_robot
 
 seed: 42
 device: cuda:0
@@ -59,7 +59,7 @@ env:
 shape_meta:
   obs:
     rgb:
-      shape: [3, 480, 640]
+      shape: [3, 224, 224]
     tokenized_prompt:
       shape: [512]  # Max instruction length
     tokenized_prompt_mask:

@@ -276,16 +276,16 @@ class PPOPi0(nn.Module):
         else:
             # Fallback - try to infer from any available tensor in cond
             B = cond["state"].shape[0]
-        # Use scalar dt for consistency with get_logprobs (matching PPOFlow)
-        dt = 1.0 / self.inference_steps
-        steps = torch.linspace(0, 1-dt, self.inference_steps).repeat(B, 1).to(self.device)
-        # Check for NaN/inf in dt and steps
+        # Use negative dt to match PI0Pytorch implementation (time goes from 1.0 to 0.0)
+        dt = -1.0 / self.inference_steps
+        time = torch.tensor(1.0, dtype=torch.float32, device=self.device)
+        # Check for NaN/inf in dt and time
         if not torch.isfinite(torch.tensor(dt)):
             logging.error(f"Invalid dt value: {dt}")
-            dt = 0.1  # Fallback
-        if torch.any(~torch.isfinite(steps)):
-            logging.error(f"Invalid steps values: {steps}")
-            steps = torch.linspace(0, 0.9, self.inference_steps).repeat(B, 1).to(self.device)
+            dt = -0.1  # Fallback
+        if not torch.isfinite(time):
+            logging.error(f"Invalid time value: {time}")
+            time = torch.tensor(1.0, dtype=torch.float32, device=self.device)
         if save_chains:
             x_chain = torch.zeros((B, self.inference_steps+1, self.horizon_steps, self.pi0_action_dim), device=self.device)
         if ret_logprob:
@@ -310,12 +310,15 @@ class PPOPi0(nn.Module):
         if save_chains:
             x_chain[:, 0] = xt
         for i in range(self.inference_steps):
+            # Break if time has reached the end (matching PI0Pytorch while loop condition)
+            if time < -dt / 2:
+                break
             try:
-                t = steps[:, i]
+                t = time.expand(B)  # Use current time for all batch elements
                 # Check for valid time values
                 if torch.any(~torch.isfinite(t)):
                     logging.warning(f"Invalid time values at step {i}: {t}")
-                    t = torch.full_like(t, i / self.inference_steps)
+                    t = torch.full_like(t, max(0.0, 1.0 - i / self.inference_steps))
                 vt, nt = self.actor_ft.forward(xt, t, cond, learn_exploration_noise=False, step=i)
                 # Critical: Check for NaN/inf in velocity and noise
                 if torch.any(~torch.isfinite(vt)):
@@ -353,9 +356,6 @@ class PPOPi0(nn.Module):
                         logging.error(f"Error during sampling at step {i}: {e}")
                         # Keep current xt if sampling fails
                         pass
-                # Final step: apply environment action bounds to robot actions only
-                if i == self.inference_steps - 1:
-                    xt = xt.clamp_(self.act_min, self.act_max)
                 if ret_logprob:
                     try:
                         logprob_transition = dist.log_prob(xt).sum(dim=(-2, -1)).to(self.device)
@@ -373,6 +373,9 @@ class PPOPi0(nn.Module):
                         pass
                 if save_chains:
                     x_chain[:, i+1] = xt
+                
+                # Update time (matching PI0Pytorch implementation)
+                time += dt
             except Exception as e:
                 logging.error(f"Critical error at denoising step {i}: {e}")
                 # Emergency fallback: use previous xt if available, otherwise zeros
@@ -384,6 +387,9 @@ class PPOPi0(nn.Module):
                     x_chain[:, i+1] = xt
         try:
             robot_actions = self.convert_pi0_to_robot_actions(xt)
+            # Apply environment action bounds to robot actions (not PI0 actions)
+            print(f"Robot actions before clamping: min={robot_actions.min().item()}, max={robot_actions.max().item()}")
+            robot_actions = robot_actions.clamp(self.act_min, self.act_max)
             # Final check for NaN in robot actions
             if torch.any(~torch.isfinite(robot_actions)):
                 logging.error(f"NaN/inf detected in final robot actions: {robot_actions}")
