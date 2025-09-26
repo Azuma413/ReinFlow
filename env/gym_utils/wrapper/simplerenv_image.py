@@ -92,7 +92,6 @@ class SimplerEnvImageWrapper(gym.Env):
             self.robot_name = "google_robot_static"
             self.default_obs_camera = "overhead_camera"
             self.default_render_camera = "overhead_camera"
-            self.control_mode = "arm_pd_ee_delta_pose_align_interpolate_by_planner_gripper_pd_joint_target_delta_pos_interpolate_by_planner"
         elif self.robot_type == "widowx":
             if self.robot_variant == "bridge_dataset":
                 self.robot_name = "widowx_bridge_dataset_camera_setup"
@@ -102,12 +101,16 @@ class SimplerEnvImageWrapper(gym.Env):
                 self.robot_name = "widowx"
             self.default_obs_camera = "3rd_view_camera"
             self.default_render_camera = "3rd_view_camera"
-            self.control_mode = "arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos"
         else:
             raise ValueError(f"Unsupported robot_type: {self.robot_type}")
         
+        # Use SimplerEnv's standard function to get control mode
+        # This ensures compatibility with SimplerEnv's robot configurations
+        self.control_mode = get_robot_control_mode(self.robot_name, "pi0")
+        
         # Debug output to verify robot configuration
         print(f"Robot configuration: type={self.robot_type}, variant={self.robot_variant}, name={self.robot_name}")
+        print(f"Control mode: {self.control_mode}")
 
     def _create_environment(self):
         """Create the ManiSkill2 environment"""

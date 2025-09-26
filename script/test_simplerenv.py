@@ -348,126 +348,13 @@ class SimplerEnvTester:
 
 def create_default_config():
     """デフォルト設定の作成（ft_ppo_pi0.yamlの構造に合わせる）"""
-    # デフォルトでft_ppo_pi0.yamlを読み込む
-    try:
-        config = OmegaConf.load("cfg/ft_ppo_pi0.yaml")
-        return config
-    except Exception as e:
-        logger.warning(f"Could not load cfg/ft_ppo_pi0.yaml: {e}")
-        # フォールバック設定
-        config = {
-            "pi0_policy_path": "weights/openpi/openpi0-bridge-torch",
-            "scene_name": "bridge_table_1_v2",
-            "robot_type": "widowx",
-            "obs_dim": 32,
-            "action_dim": 7,
-            "horizon_steps": 50,
-            "cond_steps": 1,
-            "denoising_steps": 10,
-            "ft_denoising_steps": 10,
-            "env": {
-                "n_envs": 1,
-                "max_episode_steps": 50,
-                "wrappers": {
-                    "simplerenv_image": {
-                        "scene_name": "bridge_table_1_v2",
-                        "robot_type": "widowx",
-                        "robot_variant": "sink_camera",
-                        "enable_random_scene": False,
-                        "control_freq": 3,
-                        "sim_freq": 513,
-                        "max_episode_steps": 50,
-                    },
-                    "multi_step": {
-                        "n_obs_steps": 1,
-                        "n_action_steps": 10,
-                        "max_episode_steps": 50,
-                        "reset_within_step": True,
-                    }
-                }
-            },
-            "model": {
-                "pi0_config": {
-                    "pytorch_training_precision": "float32",
-                    "model": {
-                        "action_dim": 32,
-                        "action_horizon": 50,
-                        "max_token_len": 512,
-                        "paligemma_variant": "gemma_2b",
-                        "action_expert_variant": "gemma_300m",
-                        "pi05": False,
-                    }
-                },
-                "act_min": -1,
-                "act_max": 1,
-                "noise_scheduler_type": "learn",
-                "inference_steps": 10,
-                "ft_denoising_steps": 10,
-                "randn_clip_value": 3,
-                "min_sampling_denoising_std": 0.08,
-                "min_logprob_denoising_std": 0.08,
-                "max_logprob_denoising_std": 0.16,
-                "logprob_min": -1.0,
-                "logprob_max": 1.0,
-                "clip_ploss_coef": 0.01,
-                "clip_ploss_coef_base": 0.001,
-                "clip_ploss_coef_rate": 3,
-                "clip_vloss_coef": None,
-                "denoised_clip_value": 1.0,
-                "time_dim_explore": 32,
-                "learn_explore_time_embedding": True,
-                "use_time_independent_noise": False,
-                "noise_hidden_dims": [256, 256, 256],
-                "logprob_debug_sample": False,
-                "logprob_debug_recalculate": False,
-                "explore_net_activation_type": "Tanh",
-                "pooling_mode": "cls",
-            },
-            "test": {
-                "num_episodes": 3,
-                "max_steps_per_episode": 50,
-                "seed": 42,
-            }
-        }
-        return OmegaConf.create(config)
-
+    config = OmegaConf.load("cfg/ft_ppo_pi0.yaml")
+    return config
 
 def main():
-    parser = argparse.ArgumentParser(description="SimplerEnv + PI0 Test Script")
-    parser.add_argument("--config", type=str, default=None, help="Path to config file")
-    parser.add_argument("--pi0_path", type=str, default=None, help="Path to PI0 model")
-    parser.add_argument("--robot_type", type=str, default="google_robot", 
-                       choices=["google_robot", "widowx"], help="Robot type")
-    parser.add_argument("--episodes", type=int, default=3, help="Number of test episodes")
-    parser.add_argument("--max_steps", type=int, default=50, help="Max steps per episode")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--verbose", action="store_true", help="Verbose logging")
-    args = parser.parse_args()
     # ログレベル設定
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    # 設定の読み込み
-    if args.config:
-        config = OmegaConf.load(args.config)
-    else:
-        config = create_default_config()
-    # コマンドライン引数で設定を上書き
-    if args.pi0_path:
-        config.pi0_policy_path = args.pi0_path
-    if args.robot_type:
-        config.robot_type = args.robot_type
-        config.env.wrappers.simplerenv_image.robot_type = args.robot_type
-    if args.episodes:
-        if not hasattr(config, 'test'):
-            config.test = {}
-        config.test.num_episodes = args.episodes
-    if args.max_steps:
-        if not hasattr(config, 'test'):
-            config.test = {}
-        config.test.max_steps_per_episode = args.max_steps
-    # シード設定
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    logging.getLogger().setLevel(logging.DEBUG)
+    config = create_default_config()
     # テスト実行
     tester = None
     try:
@@ -475,8 +362,8 @@ def main():
         tester = SimplerEnvTester(config)
         print("Running test...")
         results = tester.run_test(
-            num_episodes=1,
-            max_steps_per_episode=50
+            num_episodes=2,
+            max_steps_per_episode=config.env.max_episode_steps
         )
         print("Test completed successfully!")
         return results
