@@ -7,18 +7,10 @@ import logging
 import numpy as np
 from typing import Dict, Any
 from dataclasses import dataclass
-
 log = logging.getLogger(__name__)
-
 from agent.finetune.reinflow.train_ppo_flow_img_agent import TrainPPOImgFlowAgent
-from model.common.modules import RandomShiftsAug
 from model.flow.ft_ppo.ppopi0 import PPOPi0
 from agent.finetune.reinflow.buffer import PPOFlowImgBuffer, PPOFlowImgBufferGPU
-
-# Import PI0 preprocessing utilities
-import openpi_Azuma413.src.openpi.models_pytorch.preprocessing_pytorch as pi0_preprocessing
-from openpi_Azuma413.src.openpi.models.tokenizer import PaligemmaTokenizer
-
 
 @dataclass
 class PI0ObservationBatch:
@@ -44,16 +36,14 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
         self.initial_ratio_error_threshold = 1e-4  # More relaxed for PI0
         # PI0 observation processing setup
         self.max_token_len = cfg.model.pi0_config.model.max_token_len
-        self.instruction_tokenizer = PaligemmaTokenizer(max_len=self.max_token_len)
+        self.robot_type = cfg.robot_type
         log.info(f"Initialized PI0 training agent with robot_action_dim={self.robot_action_dim}, pi0_action_dim={self.pi0_action_dim}")
-        log.info(f"Initialized PaligemmaTokenizer with max_len={self.max_token_len}")
 
     def convert_simplerenv_to_pi0_observation(self, simplerenv_obs: Dict) -> PI0ObservationBatch:
         """
         Convert SimplerEnv observation format to PI0 format
         SimplerEnv obs format:
         - "rgb": image data [B, C, H, W]
-        - "instruction": language instruction string
         - "robot_type": robot type
         - "state": robot state [B, 8] (x,y,z,qw,qx,qy,qz,gripper)
         - "scene_info": scene information
@@ -66,7 +56,6 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
         """
         # print("rgb shape:", simplerenv_obs["rgb"].shape) # (1, 1, 480, 640, 3)
         # print("state shape:", simplerenv_obs.get("state", None).shape) # (1, 1, 8)
-        # print("instruction: ", simplerenv_obs["instruction"]) # ['stack the green block on the yellow block']
         batch_size = simplerenv_obs["rgb"].shape[0]
         # Process images
         rgb_images = simplerenv_obs["rgb"]  # [B, C, H, W]
@@ -84,38 +73,21 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
         }
         # Create image masks (all True since we have valid images)
         image_masks = {}
-        # Process instructions using PaligemmaTokenizer
-        if isinstance(simplerenv_obs["instruction"], (list, tuple)):
-            instructions = simplerenv_obs["instruction"]
-        else:
-            # Single instruction repeated for batch
-            instructions = [simplerenv_obs["instruction"]] * batch_size
-        # Use PaligemmaTokenizer for proper tokenization
-        tokenized_prompts = []
-        prompt_masks = []
-        for instruction in instructions:
-            if isinstance(instruction, str):
-                # Use PI0's PaligemmaTokenizer (PI0 format without state in prompt)
-                tokens, mask = self.instruction_tokenizer.tokenize(instruction, state=None)
-                tokens = torch.from_numpy(tokens).long().to(self.device)
-                mask = torch.from_numpy(mask).bool().to(self.device)
-            else:
-                # Fallback for non-string instructions
-                tokens = torch.zeros(self.max_token_len, dtype=torch.long, device=self.device)
-                mask = torch.zeros(self.max_token_len, dtype=torch.bool, device=self.device)
-            tokenized_prompts.append(tokens)
-            prompt_masks.append(mask)
-        tokenized_prompt = torch.stack(tokenized_prompts)  # [B, max_token_len]
-        tokenized_prompt_mask = torch.stack(prompt_masks)  # [B, max_token_len]
+        # Get tokenized prompts from observation (already tokenized by the environment wrapper)
+        tokenized_prompt = torch.from_numpy(simplerenv_obs["tokenized_prompt"]).to(self.device)
+        tokenized_prompt_mask = torch.from_numpy(simplerenv_obs["tokenized_prompt_mask"]).to(self.device)
+        # Ensure batch dimension
+        if tokenized_prompt.dim() == 1:
+            tokenized_prompt = tokenized_prompt.unsqueeze(0)
+            tokenized_prompt_mask = tokenized_prompt_mask.unsqueeze(0)
         # Process robot state
-        robot_type = simplerenv_obs.get("robot_type", "widowx")
         raw_state = simplerenv_obs.get("state", None)
         if raw_state is not None:
             if not isinstance(raw_state, torch.Tensor):
                 raw_state = torch.from_numpy(raw_state).float()
             raw_state = raw_state.to(self.device)
             # Convert robot state to PI0 format using robot-specific preprocessing
-            pi0_state = self.preprocess_robot_state_for_pi0(raw_state, robot_type)
+            pi0_state = self.preprocess_robot_state_for_pi0(raw_state, self.robot_type)
         else:
             # Fallback: create dummy state
             log.warning("No robot state found in observation, using dummy state")
@@ -229,8 +201,9 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
         obs_dims = {
             "rgb": self.obs_dims["rgb"],  # Image observations from SimplerEnv
             "state": (8,),  # Robot state (x,y,z,qw,qx,qy,qz,gripper)
-            "instruction": (1,),  # Placeholder for instruction (we'll handle separately)
-            "robot_type": (1,),   # Placeholder for robot type
+            # "robot_type": (1,),   # Placeholder for robot type
+            "tokenized_prompt": (self.max_token_len,),  # Tokenized prompts
+            "tokenized_prompt_mask": (self.max_token_len,),  # Token masks
         }
         if self.buffer_device == 'cpu':
             self.buffer = PPOFlowImgBuffer(
@@ -331,6 +304,8 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
             self.reset_env(buffer_device=self.buffer_device)
             self.prev_obs_venv["rgb"] = self.prev_obs_venv["rgb"].squeeze(1)
             self.prev_obs_venv["state"] = self.prev_obs_venv["state"].squeeze(1)
+            self.prev_obs_venv["tokenized_prompt"] = self.prev_obs_venv["tokenized_prompt"].squeeze(1)
+            self.prev_obs_venv["tokenized_prompt_mask"] = self.prev_obs_venv["tokenized_prompt_mask"].squeeze(1)
             self.buffer.update_full_obs()
             for step in tqdm(range(self.n_steps)) if self.verbose else range(self.n_steps):
                 if not self.verbose and step % 100 == 0: 
@@ -352,9 +327,10 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
                 action_venv = robot_actions[:, :self.act_steps]  # [n_envs, act_steps, 7]
                 obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = self.venv.step(action_venv.cpu().numpy())
                 squeezed_obs_venv = {}
-                squeezed_obs_venv["instruction"] = obs_venv["instruction"]
                 squeezed_obs_venv["rgb"] = obs_venv["rgb"].squeeze(1)
                 squeezed_obs_venv["state"] = obs_venv["state"].squeeze(1)
+                squeezed_obs_venv["tokenized_prompt"] = obs_venv["tokenized_prompt"].squeeze(1)
+                squeezed_obs_venv["tokenized_prompt_mask"] = obs_venv["tokenized_prompt_mask"].squeeze(1)
                 # Store in buffer (store PI0 chains for training)
                 self.buffer.add(step, self.prev_obs_venv, pi0_chains, reward_venv, terminated_venv, truncated_venv)
                 self.prev_obs_venv = squeezed_obs_venv

@@ -60,10 +60,12 @@ shape_meta:
   obs:
     rgb:
       shape: [3, 480, 640]
-    instruction:
-      shape: [128]  # Max instruction length
+    tokenized_prompt:
+      shape: [512]  # Max instruction length
+    tokenized_prompt_mask:
+      shape: [512]  # Max instruction length
     state:
-      shape: [32]   # PI0 state dimension
+      shape: [8]   # PI0 state dimension
   action:
     shape: [7]
 

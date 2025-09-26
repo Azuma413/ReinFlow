@@ -207,7 +207,7 @@ class MultiStep(gym.Wrapper):
             for key in self._observation_space.keys():
                 obs_history_for_key = [obs[key] for obs in self.obs]
                 # Check if this is a text/string observation or other non-numeric data
-                if isinstance(self._observation_space[key], spaces.Text) or key in ['instruction', 'robot_type', 'scene_info']:
+                if isinstance(self._observation_space[key], spaces.Text) or key in ['robot_type', 'scene_info']:
                     # For text/string data, just return the latest observation (no stacking)
                     result[key] = obs_history_for_key[-1]
                 else:

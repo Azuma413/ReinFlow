@@ -280,8 +280,21 @@ def make_async(
                     min_value, max_value = -1, 1
                 elif key.endswith("state"):
                     min_value, max_value = -1, 1
-                elif key.endswith("instruction"):
-                    # instructionはテキストデータなので、Boxスペースの定義からスキップする
+                elif key == "tokenized_prompt":
+                    observation_space[key] = spaces.Box(
+                        low=np.iinfo(np.int64).min,
+                        high=np.iinfo(np.int64).max,
+                        shape=shape,
+                        dtype=np.int64,
+                    )
+                    continue
+                elif key == "tokenized_prompt_mask":
+                    observation_space[key] = spaces.Box(
+                        low=0,
+                        high=1,
+                        shape=shape,
+                        dtype=np.bool_,
+                    )
                     continue
                 else:
                     raise RuntimeError(f"Unsupported type {key}")
@@ -297,6 +310,19 @@ def make_async(
                 1,
                 shape=(obs_dim,),
                 dtype=np.float32,
+            )
+            # Add tokenized prompt spaces for PI0
+            observation_space["tokenized_prompt"] = spaces.Box(
+                low=np.iinfo(np.int64).min,
+                high=np.iinfo(np.int64).max,
+                shape=(512,),  # Max token length for PI0
+                dtype=np.int64,
+            )
+            observation_space["tokenized_prompt_mask"] = spaces.Box(
+                low=0,
+                high=1,
+                shape=(512,),
+                dtype=np.bool_,
             )
         env.observation_space = observation_space
         env.action_space = gym.spaces.Box(-1, 1, shape=(action_dim,), dtype=np.int64)

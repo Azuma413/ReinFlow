@@ -24,7 +24,7 @@ import time
 from gymnasium import logger
 
 # from gym.vector.vector_env import VectorEnv
-from .vector_env import VectorEnv
+from env.gym_utils.vector_env import VectorEnv
 from gymnasium.error import (
     AlreadyPendingCallError,
     NoAsyncCallError,

@@ -435,7 +435,7 @@ class PPOPi0(nn.Module):
                 bc_loss = torch.tensor(0.0, device=self.device)
             else:
                 raise NotImplementedError
-        
+
         return (
             pg_loss,
             entropy_loss,

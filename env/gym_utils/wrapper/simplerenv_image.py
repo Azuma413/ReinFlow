@@ -10,6 +10,7 @@ This wrapper supports:
 
 import random
 import numpy as np
+import torch
 import gymnasium as gym
 from gymnasium import spaces
 import imageio
@@ -18,6 +19,9 @@ from typing import Dict, List, Optional, Any
 # SimplerEnv imports
 from SimplerEnv.simpler_env.utils.env.env_builder import build_maniskill2_env, get_robot_control_mode
 from SimplerEnv.simpler_env.utils.env.observation_utils import get_image_from_maniskill2_obs_dict
+
+# PI0 imports for tokenization
+from openpi_Azuma413.src.openpi.models.tokenizer import PaligemmaTokenizer
 
 
 class SimplerEnvImageWrapper(gym.Env):
@@ -37,6 +41,7 @@ class SimplerEnvImageWrapper(gym.Env):
         max_episode_steps: int = 80,
         obs_camera_name: Optional[str] = None,
         render_camera_name: Optional[str] = None,
+        max_token_len: int = 512,
         **env_kwargs
     ):
         # Store configuration
@@ -50,7 +55,10 @@ class SimplerEnvImageWrapper(gym.Env):
         self.control_freq = control_freq
         self.sim_freq = sim_freq
         self.max_episode_steps = max_episode_steps
+        self.max_token_len = max_token_len
         self.env_kwargs = env_kwargs
+        # Initialize PI0 tokenizer
+        self.instruction_tokenizer = PaligemmaTokenizer(max_len=self.max_token_len)
         # Configure robot-specific settings
         self._setup_robot_config()
         # Set camera names
@@ -174,6 +182,19 @@ class SimplerEnvImageWrapper(gym.Env):
             )
             # Add robot_type space (categorical, but we'll use Text for simplicity)
             observation_space["robot_type"] = spaces.Text(max_length=50)
+        # Always add tokenized prompt spaces
+        observation_space["tokenized_prompt"] = spaces.Box(
+            low=np.iinfo(np.int64).min,
+            high=np.iinfo(np.int64).max,
+            shape=(self.max_token_len,),
+            dtype=np.int64,
+        )
+        observation_space["tokenized_prompt_mask"] = spaces.Box(
+            low=0,
+            high=1,
+            shape=(self.max_token_len,),
+            dtype=np.bool_,
+        )
         self.observation_space = observation_space
 
     def _select_random_scene(self):
@@ -299,21 +320,26 @@ class SimplerEnvImageWrapper(gym.Env):
             self.env, raw_obs, camera_name=self.obs_camera_name
         )
         instruction = self.env.get_language_instruction()
-        if instruction is None:
+        if not isinstance(instruction, str):
+            print("Warning: instruction is not a string, using default")
             instruction = "pick up something"
+        tokens, mask = self.instruction_tokenizer.tokenize(instruction, state=None)
+        tokenized_prompt = torch.from_numpy(tokens).long().cpu().numpy()
+        tokenized_prompt_mask = torch.from_numpy(mask).bool().cpu().numpy()
         # Get robot state information
         state = self._get_robot_state(raw_obs)
         obs = {
             "rgb": image.astype(np.float32),  # Convert to float32, keep [0-255] range
-            "instruction": instruction,
-            "robot_type": self.robot_type,
+            # "robot_type": self.robot_type,
             "state": state,  # Add robot state
-            "scene_info": {
-                "env_name": self.current_env_name,
-                "scene_name": self.current_scene_name,
-                "robot_name": self.robot_name,
-                "camera_name": self.obs_camera_name
-            }
+            "tokenized_prompt": tokenized_prompt,
+            "tokenized_prompt_mask": tokenized_prompt_mask,
+            # "scene_info": {
+            #     "env_name": self.current_env_name,
+            #     "scene_name": self.current_scene_name,
+            #     "robot_name": self.robot_name,
+            #     "camera_name": self.obs_camera_name
+            # }
         }
         return obs
 
@@ -348,7 +374,6 @@ class SimplerEnvImageWrapper(gym.Env):
             self._create_environment()
             self._setup_spaces(shape_meta=None)
         # Reset environment
-        print("options: ", options)
         env_reset_options = options.copy()
         env_reset_options.pop("video_path", None)
         env_reset_options.pop("seed", None)

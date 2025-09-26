@@ -1287,7 +1287,13 @@ class PPOFlowImgBufferGPU(PPOFlowBufferGPU):
     def add(self, step, prev_obs_venv, chains_actions_venv, reward_venv, terminated_venv, truncated_venv):
         # visual inputs: rgb, state
         for k in self.obs_trajs:
-            self.obs_trajs[k][step] = torch.from_numpy(prev_obs_venv[k]).float().to(self.device)
+            obs_numpy = prev_obs_venv[k]
+            # print(f"obs {k} shape: {obs_numpy.shape}")
+            if k == 'rgb' and obs_numpy.ndim == 4 and obs_numpy.shape[3] == 3:
+                obs_tensor = torch.from_numpy(obs_numpy).permute(0,3,1,2) # (e, H, W, C) -> (e, C, H, W)
+            else:
+                obs_tensor = torch.from_numpy(obs_numpy)
+            self.obs_trajs[k][step] = obs_tensor.float().to(self.device)
         self.chains_trajs[step] = chains_actions_venv
         self.reward_trajs[step] = torch.from_numpy(reward_venv).float().to(self.device)
         self.terminated_trajs[step] = torch.from_numpy(terminated_venv).float().to(self.device)
