@@ -144,7 +144,7 @@ class MultiStep(gym.Wrapper):
         options: Optional[Dict[str, Any]] = None,
     ) -> tuple[Any, Dict[str, Any]]:
         """Resets the environment to a starting state."""
-        super().reset(seed=seed)
+        # super().reset(seed=seed)を削除（重複を避けるため）
         obs, info = self.env.reset(seed=seed, options=options)
         self.obs = deque([obs], maxlen=max(self.n_obs_steps + 1, self.n_action_steps))
         if self.prev_action:

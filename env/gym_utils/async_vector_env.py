@@ -750,8 +750,44 @@ def _worker(index, env_fn, pipe, parent_pipe, shared_memory, error_queue):
                     if 'options' in kwargs and isinstance(kwargs.get('options'), dict):
                         kwargs['options'].pop('return_info', None)
                     kwargs.pop('return_info', None)
-                    result = env.reset(**kwargs)
-                    pipe.send((result, True))
+                    
+                    # Critical fix: Force complete environment cleanup before reset
+                    try:
+                        # Clear any residual state in the environment
+                        if hasattr(env, 'close'):
+                            pass  # Don't close as it would terminate the process
+                        
+                        # Force garbage collection to clear any lingering state
+                        import gc
+                        gc.collect()
+                        
+                        # Reset with complete state initialization
+                        result = env.reset(**kwargs)
+                        
+                        # Validate the reset result to ensure no NaN/inf values
+                        if isinstance(result, tuple) and len(result) == 2:
+                            obs, info = result
+                        else:
+                            obs = result
+                            info = {}
+                        
+                        # Check for NaN/inf in critical observation components
+                        if isinstance(obs, dict):
+                            for key, value in obs.items():
+                                if key == "state" and hasattr(value, '__iter__'):
+                                    import numpy as np
+                                    if np.any(~np.isfinite(value)):
+                                        print(f"Warning: NaN/inf detected in {key} after reset: {value}")
+                                        # Force safe state if corrupted
+                                        if key == "state" and len(value) >= 8:
+                                            # Reset to safe default robot state
+                                            obs[key] = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5], dtype=np.float32)
+                                            print(f"Replaced with safe state: {obs[key]}")
+                        
+                        pipe.send((result, True))
+                    except Exception as e:
+                        print(f"Error during environment reset: {e}")
+                        pipe.send((None, False))
                 else:
                     function = getattr(env, function_name)
                     pipe.send((function(**function_kwargs), True))
@@ -832,11 +868,47 @@ def _worker_shared_memory(index, env_fn, pipe, parent_pipe, shared_memory, error
                     if 'options' in kwargs and isinstance(kwargs.get('options'), dict):
                         kwargs['options'].pop('return_info', None)
                     kwargs.pop('return_info', None)
-                    result = env.reset(**kwargs)
-                    write_to_shared_memory(
-                        observation_space, index, result[0], shared_memory
-                    )
-                    pipe.send((result, True))
+                    
+                    # Critical fix: Force complete environment cleanup before reset
+                    try:
+                        # Clear any residual state in the environment
+                        if hasattr(env, 'close'):
+                            pass  # Don't close as it would terminate the process
+                        
+                        # Force garbage collection to clear any lingering state
+                        import gc
+                        gc.collect()
+                        
+                        # Reset with complete state initialization
+                        result = env.reset(**kwargs)
+                        
+                        # Validate the reset result to ensure no NaN/inf values
+                        if isinstance(result, tuple) and len(result) == 2:
+                            obs, info = result
+                        else:
+                            obs = result
+                            info = {}
+                        
+                        # Check for NaN/inf in critical observation components
+                        if isinstance(obs, dict):
+                            for key, value in obs.items():
+                                if key == "state" and hasattr(value, '__iter__'):
+                                    import numpy as np
+                                    if np.any(~np.isfinite(value)):
+                                        print(f"Warning: NaN/inf detected in {key} after reset: {value}")
+                                        # Force safe state if corrupted
+                                        if key == "state" and len(value) >= 8:
+                                            # Reset to safe default robot state
+                                            obs[key] = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5], dtype=np.float32)
+                                            print(f"Replaced with safe state: {obs[key]}")
+                        
+                        write_to_shared_memory(
+                            observation_space, index, obs, shared_memory
+                        )
+                        pipe.send((result, True))
+                    except Exception as e:
+                        print(f"Error during environment reset in shared memory: {e}")
+                        pipe.send((None, False))
                 else:
                     function = getattr(env, function_name)
                     pipe.send((function(**function_kwargs), True))

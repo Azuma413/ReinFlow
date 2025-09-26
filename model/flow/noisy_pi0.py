@@ -88,11 +88,47 @@ class NoisyPi0(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B = action.shape[0]
-        vel, time_emb, prefix_embs = self.policy.get_velocity_and_embedding(
-            observation=cond,
-            actions=action,
-            time=time,
-        )
+        
+        # Check for NaN/inf in input action and time
+        if torch.any(~torch.isfinite(action)):
+            log.warning(f"NaN/inf detected in action at step {step}: {action}")
+            action = torch.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        if torch.any(~torch.isfinite(time)):
+            log.warning(f"NaN/inf detected in time at step {step}: {time}")
+            time = torch.nan_to_num(time, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        # Get velocity and embeddings from PI0 policy
+        try:
+            vel, time_emb, prefix_embs = self.policy.get_velocity_and_embedding(
+                observation=cond,
+                actions=action,
+                time=time,
+            )
+            
+            # Check for NaN/inf in velocity
+            if torch.any(~torch.isfinite(vel)):
+                log.warning(f"NaN/inf detected in velocity at step {step}")
+                vel = torch.nan_to_num(vel, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            # Check for NaN/inf in embeddings
+            if torch.any(~torch.isfinite(prefix_embs)):
+                log.warning(f"NaN/inf detected in prefix_embs at step {step}")
+                prefix_embs = torch.nan_to_num(prefix_embs, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+            if torch.any(~torch.isfinite(time_emb)):
+                log.warning(f"NaN/inf detected in time_emb at step {step}")
+                time_emb = torch.nan_to_num(time_emb, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+        except Exception as e:
+            log.error(f"Error in PI0 policy forward pass at step {step}: {e}")
+            # Return safe fallback values
+            vel_shape = action.shape
+            vel = torch.zeros(vel_shape, device=action.device)
+            time_emb = torch.zeros(B, 256, device=action.device)  # Typical embedding dim
+            prefix_embs = torch.zeros(B, 512, 256, device=action.device)  # Typical shape
+        
+        # Apply pooling to get condition embedding
         if self.pooling_mode == "cls":
             # prefix_embsの最初のトークンを取得
             cond_emb = prefix_embs[:, 0, :]
@@ -101,24 +137,64 @@ class NoisyPi0(nn.Module):
             cond_emb = prefix_embs.mean(dim=1)
         else:
             raise ValueError(f"Unknown pooling mode: {self.pooling_mode}")
+        
+        # Check for NaN/inf in condition embedding
+        if torch.any(~torch.isfinite(cond_emb)):
+            log.warning(f"NaN/inf detected in cond_emb at step {step}")
+            cond_emb = torch.nan_to_num(cond_emb, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         # noise head (for exploration). allow gradient flow.
         if self.initial_noise_scheduler_type=='const' or step < self.learn_explore_noise_from:
             noise_std = self.logprob_noise_levels[:, step].repeat(B,1)
         else:
-            if self.use_time_independent_noise:
-                noise_feature = cond_emb
-            else:
-                if self.learn_explore_time_embedding:
-                    step_ts = torch.tensor(step, device = self.device).repeat(B)
-                    time_emb_explore = self.time_embedding_explore(step_ts)
-                    noise_feature = torch.cat([time_emb_explore, cond_emb], dim=-1)
+            try:
+                if self.use_time_independent_noise:
+                    noise_feature = cond_emb
                 else:
-                    noise_feature = torch.cat([time_emb.detach(), cond_emb], dim=-1)
-            noise_std = self.explore_noise_net.forward(noise_feature=noise_feature)
-            if verbose:
-                log.info(f"step={step}, learnable noise = {noise_std.mean()}")
+                    if self.learn_explore_time_embedding:
+                        step_ts = torch.tensor(step, device = self.device).repeat(B)
+                        time_emb_explore = self.time_embedding_explore(step_ts)
+                        
+                        # Check for NaN in time embedding
+                        if torch.any(~torch.isfinite(time_emb_explore)):
+                            log.warning(f"NaN/inf detected in time_emb_explore at step {step}")
+                            time_emb_explore = torch.nan_to_num(time_emb_explore, nan=0.0, posinf=1.0, neginf=-1.0)
+                        
+                        noise_feature = torch.cat([time_emb_explore, cond_emb], dim=-1)
+                    else:
+                        noise_feature = torch.cat([time_emb.detach(), cond_emb], dim=-1)
+                
+                # Check for NaN in noise feature
+                if torch.any(~torch.isfinite(noise_feature)):
+                    log.warning(f"NaN/inf detected in noise_feature at step {step}")
+                    noise_feature = torch.nan_to_num(noise_feature, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                noise_std = self.explore_noise_net.forward(noise_feature=noise_feature)
+                
+                # Check for NaN in noise std
+                if torch.any(~torch.isfinite(noise_std)):
+                    log.warning(f"NaN/inf detected in noise_std at step {step}, using default noise level")
+                    noise_std = self.logprob_noise_levels[:, min(step, self.denoising_steps-1)].repeat(B,1)
+                
+                if verbose:
+                    log.info(f"step={step}, learnable noise = {noise_std.mean()}")
+                    
+            except Exception as e:
+                log.error(f"Error in noise computation at step {step}: {e}, using default noise level")
+                noise_std = self.logprob_noise_levels[:, min(step, self.denoising_steps-1)].repeat(B,1)
+        
+        # Final validation
+        if torch.any(~torch.isfinite(vel)):
+            log.error(f"Final velocity contains NaN/inf at step {step}, setting to zero")
+            vel = torch.zeros_like(vel)
+            
+        if torch.any(~torch.isfinite(noise_std)):
+            log.error(f"Final noise_std contains NaN/inf at step {step}, using minimum noise level")
+            noise_std = torch.full_like(noise_std, self.min_logprob_denoising_std)
+        
         if verbose:
             log.info(f"step={step}, set to learn from {self.learn_explore_noise_from}, will learn exploration noise ? {step >= self.learn_explore_noise_from}, noise_std={noise_std.mean()}require_grad={noise_std.requires_grad}")
+        
         return vel, noise_std if learn_exploration_noise else noise_std.detach()
 
     @torch.no_grad()

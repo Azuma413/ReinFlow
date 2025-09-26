@@ -30,6 +30,7 @@ dependencies = [
     "openpi-client",
     "transformers==4.53.2",
     "pytest>=8.3.5",
+    "mediapy>=1.2.4",
 ]
 
 [project.optional-dependencies]

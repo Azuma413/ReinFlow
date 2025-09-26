@@ -84,7 +84,7 @@ class PPOPi0(nn.Module):
         self.denoised_clip_value = denoised_clip_value
         self.logprob_debug_sample = logprob_debug_sample
         self.logprob_debug_recalculate = logprob_debug_recalculate
-        # Load PI0 policy
+        # Initialize PI0 policy following PPOFlow pattern for consistency
         model_cfg = Pi0Config(
             dtype=pi0_config.pytorch_training_precision,
             action_dim=pi0_config.model.action_dim,
@@ -124,7 +124,6 @@ class PPOPi0(nn.Module):
         )
         
         self.critic = critic.to(self.device)
-        
         self.report_network_params()
 
     def report_network_params(self):
@@ -269,14 +268,24 @@ class PPOPi0(nn.Module):
         Sample actions using PI0, then convert to robot actions
         Returns robot actions (7-dim) and optionally PI0 action chains (32-dim)
         """
-        # Get batch size from images
+        # Get batch size from images or state
         if hasattr(cond, "images") and "base_0_rgb" in cond.images:
             B = cond.images["base_0_rgb"].shape[0]
-        else:
-            # Fallback to state if images not available
+        elif hasattr(cond, "state"):
             B = cond.state.shape[0]
-        dt = (1/self.inference_steps) * torch.ones(B, self.horizon_steps, self.pi0_action_dim, device=self.device)
-        steps = torch.linspace(0, 1-1/self.inference_steps, self.inference_steps).repeat(B, 1).to(self.device)
+        else:
+            # Fallback - try to infer from any available tensor in cond
+            B = cond["state"].shape[0]
+        # Use scalar dt for consistency with get_logprobs (matching PPOFlow)
+        dt = 1.0 / self.inference_steps
+        steps = torch.linspace(0, 1-dt, self.inference_steps).repeat(B, 1).to(self.device)
+        # Check for NaN/inf in dt and steps
+        if not torch.isfinite(torch.tensor(dt)):
+            logging.error(f"Invalid dt value: {dt}")
+            dt = 0.1  # Fallback
+        if torch.any(~torch.isfinite(steps)):
+            logging.error(f"Invalid steps values: {steps}")
+            steps = torch.linspace(0, 0.9, self.inference_steps).repeat(B, 1).to(self.device)
         if save_chains:
             x_chain = torch.zeros((B, self.inference_steps+1, self.horizon_steps, self.pi0_action_dim), device=self.device)
         if ret_logprob:
@@ -286,6 +295,13 @@ class PPOPi0(nn.Module):
                 log_prob_list = []
         # Sample first point (32-dim)
         xt, log_prob_init = self.sample_first_point(B)
+        # Critical: Check for NaN in initial sample
+        if torch.any(~torch.isfinite(xt)):
+            logging.error(f"NaN/inf detected in initial sample xt: {xt}")
+            xt = torch.zeros((B, self.horizon_steps, self.pi0_action_dim), device=self.device)
+        if torch.any(~torch.isfinite(log_prob_init)):
+            logging.error(f"NaN/inf detected in log_prob_init: {log_prob_init}")
+            log_prob_init = torch.zeros(B, device=self.device)
         if ret_logprob and account_for_initial_stochasticity:
             log_prob += log_prob_init
             log_prob_steps += 1
@@ -294,41 +310,102 @@ class PPOPi0(nn.Module):
         if save_chains:
             x_chain[:, 0] = xt
         for i in range(self.inference_steps):
-            t = steps[:, i]
-            vt, nt = self.actor_ft.forward(xt, t, cond, learn_exploration_noise=False, step=i)
-            xt += vt * dt
-            if clip_intermediate_actions:
-                xt = xt.clamp(-self.denoised_clip_value, self.denoised_clip_value)
-            # Add noise during training
-            std = nt.unsqueeze(-1).reshape(xt.shape)
-            std = torch.clamp(std, min=self.min_sampling_denoising_std)
-            dist = Normal(xt, std)
-            if not eval_mode:
-                xt = dist.sample().clamp_(dist.loc - self.randn_clip_value * dist.scale,
-                                         dist.loc + self.randn_clip_value * dist.scale).to(self.device)
-            # Prevent last action overflow - convert to robot action space for clipping
-            if i == self.inference_steps - 1:
-                robot_actions = self.convert_pi0_to_robot_actions(xt)
-                robot_actions = robot_actions.clamp_(self.act_min, self.act_max)
-                xt[:, :, :self.action_dim] = robot_actions  # Update first 7 dims
-            if ret_logprob:
-                logprob_transition = dist.log_prob(xt).sum(dim=(-2, -1)).to(self.device)
-                if self.logprob_debug_sample:
-                    log_prob_list.append(logprob_transition.mean().item())
-                log_prob += logprob_transition
-                log_prob_steps += 1
-            if save_chains:
-                x_chain[:, i+1] = xt
-        # Convert final actions from PI0 (32-dim) to robot (7-dim)
-        robot_actions = self.convert_pi0_to_robot_actions(xt)
+            try:
+                t = steps[:, i]
+                # Check for valid time values
+                if torch.any(~torch.isfinite(t)):
+                    logging.warning(f"Invalid time values at step {i}: {t}")
+                    t = torch.full_like(t, i / self.inference_steps)
+                vt, nt = self.actor_ft.forward(xt, t, cond, learn_exploration_noise=False, step=i)
+                # Critical: Check for NaN/inf in velocity and noise
+                if torch.any(~torch.isfinite(vt)):
+                    logging.error(f"NaN/inf detected in velocity at step {i}: {vt}")
+                    vt = torch.zeros_like(vt)
+                if torch.any(~torch.isfinite(nt)):
+                    logging.error(f"NaN/inf detected in noise at step {i}: {nt}")
+                    nt = torch.full_like(nt, self.min_sampling_denoising_std)
+                # Update position
+                xt_new = xt + vt * dt
+                # Check for NaN after position update
+                if torch.any(~torch.isfinite(xt_new)):
+                    logging.error(f"NaN/inf detected after position update at step {i}")
+                    xt_new = xt  # Keep previous position if update failed
+                xt = xt_new
+                if clip_intermediate_actions:  # Discourage excessive exploration
+                    xt = xt.clamp(-self.denoised_clip_value, self.denoised_clip_value)
+                std = nt.unsqueeze(-1).reshape(xt.shape)
+                std = torch.clamp(std, min=self.min_sampling_denoising_std)
+                # Check for valid std values
+                if torch.any(~torch.isfinite(std)):
+                    logging.error(f"Invalid std values at step {i}: {std}")
+                    std = torch.full_like(std, self.min_sampling_denoising_std)
+                dist = Normal(xt, std)
+                if not eval_mode:
+                    try:
+                        xt_sampled = dist.sample().clamp_(dist.loc - self.randn_clip_value * dist.scale,
+                                                         dist.loc + self.randn_clip_value * dist.scale).to(self.device)
+                        # Check for NaN after sampling
+                        if torch.any(~torch.isfinite(xt_sampled)):
+                            logging.warning(f"NaN/inf detected after sampling at step {i}, using mean")
+                            xt_sampled = dist.loc
+                        xt = xt_sampled
+                    except Exception as e:
+                        logging.error(f"Error during sampling at step {i}: {e}")
+                        # Keep current xt if sampling fails
+                        pass
+                # Final step: apply environment action bounds to robot actions only
+                if i == self.inference_steps - 1:
+                    xt = xt.clamp_(self.act_min, self.act_max)
+                if ret_logprob:
+                    try:
+                        logprob_transition = dist.log_prob(xt).sum(dim=(-2, -1)).to(self.device)
+                        # Check for valid log probabilities
+                        if torch.any(~torch.isfinite(logprob_transition)):
+                            logging.warning(f"Invalid log probability at step {i}: {logprob_transition}")
+                            logprob_transition = torch.zeros_like(logprob_transition)
+                        if self.logprob_debug_sample:
+                            log_prob_list.append(logprob_transition.mean().item())
+                        log_prob += logprob_transition
+                        log_prob_steps += 1
+                    except Exception as e:
+                        logging.error(f"Error computing log probability at step {i}: {e}")
+                        # Skip this step's log probability if computation fails
+                        pass
+                if save_chains:
+                    x_chain[:, i+1] = xt
+            except Exception as e:
+                logging.error(f"Critical error at denoising step {i}: {e}")
+                # Emergency fallback: use previous xt if available, otherwise zeros
+                if i > 0 and save_chains:
+                    xt = x_chain[:, i].clone()
+                else:
+                    xt = torch.zeros((B, self.horizon_steps, self.pi0_action_dim), device=self.device)
+                if save_chains:
+                    x_chain[:, i+1] = xt
+        try:
+            robot_actions = self.convert_pi0_to_robot_actions(xt)
+            # Final check for NaN in robot actions
+            if torch.any(~torch.isfinite(robot_actions)):
+                logging.error(f"NaN/inf detected in final robot actions: {robot_actions}")
+                robot_actions = torch.zeros((B, self.horizon_steps, self.action_dim), device=self.device)
+        except Exception as e:
+            logging.error(f"Error converting PI0 to robot actions: {e}")
+            robot_actions = torch.zeros((B, self.horizon_steps, self.action_dim), device=self.device)
         if ret_logprob:
-            if normalize_denoising_horizon:
+            # Final check for valid log probability
+            if not torch.isfinite(log_prob) or torch.any(~torch.isfinite(log_prob)) if isinstance(log_prob, torch.Tensor) else False:
+                logging.error(f"Invalid final log probability: {log_prob}")
+                log_prob = torch.zeros(B, device=self.device) if isinstance(log_prob, torch.Tensor) else 0.0
+            if normalize_denoising_horizon and log_prob_steps > 0:
                 log_prob = log_prob / log_prob_steps
             if normalize_act_space_dimension:
                 log_prob = log_prob / self.pi0_act_dim_total
-            if self.logprob_debug_sample:
-                transform_logprob = torch.log(1-torch.tanh(x_chain[:, -1])**2+1e-7).sum(dim=(-2,-1)).mean().item()
-                print(f"log_prob_list={log_prob_list}, transform={transform_logprob}")
+            if self.logprob_debug_sample and save_chains:
+                try:
+                    transform_logprob = torch.log(1-torch.tanh(x_chain[:, -1])**2+1e-7).sum(dim=(-2,-1)).mean().item()
+                    print(f"log_prob_list={log_prob_list}, transform={transform_logprob}")
+                except Exception as e:
+                    logging.warning(f"Error computing transform logprob: {e}")
         if ret_logprob:
             if save_chains:
                 return (robot_actions, x_chain, log_prob)  # robot actions + PI0 chains

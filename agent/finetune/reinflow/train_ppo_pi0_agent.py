@@ -81,13 +81,13 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
             tokenized_prompt = tokenized_prompt.unsqueeze(0)
             tokenized_prompt_mask = tokenized_prompt_mask.unsqueeze(0)
         # Process robot state
-        raw_state = simplerenv_obs.get("state", None)
-        if raw_state is not None:
-            if not isinstance(raw_state, torch.Tensor):
-                raw_state = torch.from_numpy(raw_state).float()
-            raw_state = raw_state.to(self.device)
-            # Convert robot state to PI0 format using robot-specific preprocessing
-            pi0_state = self.preprocess_robot_state_for_pi0(raw_state, self.robot_type)
+        processed_state = simplerenv_obs.get("state", None)
+        if processed_state is not None:
+            if not isinstance(processed_state, torch.Tensor):
+                processed_state = torch.from_numpy(processed_state).float()
+            processed_state = processed_state.to(self.device)
+            # Expand 8-dimensional processed state to 32-dimensional PI0 format
+            pi0_state = self.expand_state_to_pi0_dimension(processed_state)
         else:
             # Fallback: create dummy state
             log.warning("No robot state found in observation, using dummy state")
@@ -102,79 +102,50 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
             token_loss_mask=None,
         )
 
-    def preprocess_robot_state_for_pi0(self, raw_state: torch.Tensor, robot_type: str) -> torch.Tensor:
+    def expand_state_to_pi0_dimension(self, processed_state: torch.Tensor) -> torch.Tensor:
         """
-        Convert robot state to PI0 format using robot-specific preprocessing
-        Based on pi0_or_fast.py preprocessing methods
+        Expand processed 8-dimensional state to 32-dimensional PI0 format
+        (環境側で前処理済みの8次元状態を32次元に拡張するだけ)
         Args:
-            raw_state: [B, 8] tensor with [x, y, z, qw, qx, qy, qz, gripper]
-            robot_type: "widowx" or "google_robot"
+            processed_state: [B, 8] tensor with preprocessed robot state
         Returns:
             pi0_state: [B, 32] tensor in PI0 format
         """
-        batch_size = raw_state.shape[0]
-        if robot_type == "widowx":
-            # WidowX preprocessing: xyz + rpy + pad + gripper_openness
+        batch_size = processed_state.shape[0]
+        
+        # Check for NaN/inf in input
+        if torch.any(~torch.isfinite(processed_state)):
+            log.warning(f"Warning: Invalid values in processed_state: {processed_state}")
+            # Use safe default state
+            return torch.zeros(batch_size, 32, dtype=torch.float32, device=self.device)
+        
+        try:
+            # Simply pad the 8-dimensional processed state to 32 dimensions
             pi0_states = []
             for i in range(batch_size):
-                eef_pos = raw_state[i].cpu().numpy()  # [8] - [x,y,z,qw,qx,qy,qz,gripper]
-                # Convert quaternion to rotation matrix then to euler angles
-                from transforms3d.quaternions import quat2mat
-                from transforms3d.euler import mat2euler
-                # Extract position and quaternion
-                position = eef_pos[:3]  # xyz
-                quat_wxyz = eef_pos[3:7]  # [qw, qx, qy, qz]
-                gripper_openness = eef_pos[7]  # gripper openness
-                # Convert quaternion to rotation matrix
-                rm_bridge = quat2mat(quat_wxyz)
-                # Apply default rotation transformation for WidowX Bridge
-                # EE pose in Bridge data was relative to a top-down pose
-                default_rot = np.array([[0, 0, 1.0], [0, 1.0, 0], [-1.0, 0, 0]])
-                rpy_bridge_converted = mat2euler(rm_bridge @ default_rot.T)
-                # Create PI0 state: [xyz, rpy, pad, gripper_openness, zeros...]
-                pi0_state = np.concatenate([
-                    position,  # [x, y, z]
-                    rpy_bridge_converted,  # [roll, pitch, yaw]
-                    np.zeros(1),  # pad
-                    [gripper_openness],  # gripper openness
-                ])
-                # Pad to 32 dimensions
-                if len(pi0_state) < 32:
-                    pi0_state = np.concatenate([pi0_state, np.zeros(32 - len(pi0_state))])
-                else:
-                    pi0_state = pi0_state[:32]
+                state_8d = processed_state[i].cpu().numpy()  # [8] - already processed by environment
+                
+                # Check for valid input values
+                if not np.all(np.isfinite(state_8d)):
+                    log.warning(f"Invalid state_8d at batch {i}: {state_8d}")
+                    pi0_states.append(np.zeros(32, dtype=np.float32))
+                    continue
+                
+                # Pad to 32 dimensions (environment already did the robot-specific processing)
+                pi0_state = np.concatenate([state_8d, np.zeros(32 - 8)])
+                
+                # Final check for NaN values
+                if not np.all(np.isfinite(pi0_state)):
+                    log.warning(f"Final pi0_state contains invalid values, using zeros")
+                    pi0_state = np.zeros(32, dtype=np.float32)
+                
                 pi0_states.append(pi0_state)
+            
             pi0_states = np.stack(pi0_states)
             return torch.from_numpy(pi0_states).float().to(self.device)
-        elif robot_type == "google_robot":
-            # Google Robot preprocessing: xyz + quat_xyzw + gripper_closedness
-            pi0_states = []
-            for i in range(batch_size):
-                eef_pos = raw_state[i].cpu().numpy()  # [8] - [x,y,z,qw,qx,qy,qz,gripper]
-                # Extract position and quaternion
-                position = eef_pos[:3]  # xyz
-                quat_wxyz = eef_pos[3:7]  # [qw, qx, qy, qz]
-                gripper_width = eef_pos[7]  # gripper openness (0=closed, 1=open)
-                # Convert wxyz to xyzw format
-                quat_xyzw = np.roll(quat_wxyz, -1)  # [qx, qy, qz, qw]
-                # Convert gripper openness to closedness
-                gripper_closedness = 1 - gripper_width
-                # Create PI0 state: [xyz, quat_xyzw, gripper_closedness, zeros...]
-                pi0_state = np.concatenate([
-                    position,  # [x, y, z]
-                    quat_xyzw,  # [qx, qy, qz, qw]
-                    [gripper_closedness],  # gripper closedness
-                ])
-                # Pad to 32 dimensions
-                if len(pi0_state) < 32:
-                    pi0_state = np.concatenate([pi0_state, np.zeros(32 - len(pi0_state))])
-                else:
-                    pi0_state = pi0_state[:32]
-                pi0_states.append(pi0_state)
-            pi0_states = np.stack(pi0_states)
-            return torch.from_numpy(pi0_states).float().to(self.device)
-        else:
-            log.warning(f"Unknown robot_type: {robot_type}, using zero state")
+            
+        except Exception as e:
+            log.warning(f"Error expanding state to PI0 dimension: {e}, using zero state")
             return torch.zeros(batch_size, 32, dtype=torch.float32, device=self.device)
 
     def pi0_observation_to_dict(self, pi0_obs: PI0ObservationBatch) -> Dict:
@@ -231,7 +202,7 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
             self.buffer = PPOFlowImgBufferGPU(
                 n_steps=self.n_steps,
                 n_envs=self.n_envs,
-                n_ft_denoising_steps=self.inference_steps, 
+                n_ft_denoising_steps=self.inference_steps,
                 horizon_steps=self.horizon_steps,
                 act_steps=self.act_steps,
                 action_dim=self.pi0_action_dim,  # Use PI0 action dimension for chains
@@ -325,7 +296,39 @@ class TrainPPOPi0Agent(TrainPPOImgFlowAgent):
                     )
                 # Apply multi-step action (use robot actions for environment)
                 action_venv = robot_actions[:, :self.act_steps]  # [n_envs, act_steps, 7]
-                obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = self.venv.step(action_venv.cpu().numpy())
+                
+                # Critical: Final check for NaN/inf in actions before sending to environment
+                if isinstance(action_venv, torch.Tensor):
+                    if torch.any(~torch.isfinite(action_venv)):
+                        log.error(f"NaN/inf detected in action_venv at step {step}: {action_venv}")
+                        # Replace NaN/inf with zero actions
+                        action_venv = torch.nan_to_num(action_venv, nan=0.0, posinf=1.0, neginf=-1.0)
+                        # Clamp to valid range
+                        action_venv = torch.clamp(action_venv, -1.0, 1.0)
+                        log.info(f"Replaced with safe actions: {action_venv[0][0]}")
+                    
+                    action_venv_numpy = action_venv.cpu().numpy()
+                else:
+                    action_venv_numpy = action_venv
+                
+                # Additional check for numpy array
+                if np.any(~np.isfinite(action_venv_numpy)):
+                    log.error(f"NaN/inf detected in action_venv_numpy at step {step}: {action_venv_numpy}")
+                    action_venv_numpy = np.nan_to_num(action_venv_numpy, nan=0.0, posinf=1.0, neginf=-1.0)
+                    action_venv_numpy = np.clip(action_venv_numpy, -1.0, 1.0)
+                    log.info(f"Replaced with safe numpy actions: {action_venv_numpy[0][0]}")
+                
+                print("action_venv: ", action_venv_numpy[0][0])
+                
+                # Validate action shape
+                expected_shape = (self.n_envs, self.act_steps, self.robot_action_dim)
+                if action_venv_numpy.shape != expected_shape:
+                    log.error(f"Invalid action shape: {action_venv_numpy.shape}, expected: {expected_shape}")
+                    # Create safe default actions
+                    action_venv_numpy = np.zeros(expected_shape, dtype=np.float32)
+                    log.info(f"Using zero actions due to shape mismatch")
+                
+                obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = self.venv.step(action_venv_numpy)
                 squeezed_obs_venv = {}
                 squeezed_obs_venv["rgb"] = obs_venv["rgb"].squeeze(1)
                 squeezed_obs_venv["state"] = obs_venv["state"].squeeze(1)

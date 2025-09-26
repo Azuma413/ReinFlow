@@ -1,6 +1,6 @@
 ################################
 env_suite: simplerenv
-env_name: GraspSingleRandomObjectInScene-v0
+env_name: SimplerEnvImage
 
 obs_dim: 32  # PI0 state dimension
 cond_steps: 1
@@ -18,19 +18,19 @@ hydra:
 _target_: agent.finetune.reinflow.train_ppo_pi0_agent.TrainPPOPi0Agent
 name: ${env_name}_ft_pi0_img_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}_seed${seed}
 logdir: ${oc.env:REINFLOW_LOG_DIR}/simplerenv/finetune/${env_name}_ft_pi0_img_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
-# google robot -> weights/openpi/openpi0-fractal-torch
-# widowx robot -> weights/openpi/openpi0-bridge-torch
+# google_robot -> weights/openpi/openpi0-fractal-torch
+# widowx -> weights/openpi/openpi0-bridge-torch
 pi0_policy_path: weights/openpi/openpi0-bridge-torch  # Path to pre-trained PI0 checkpoint
-scene_name: bridge_table_1_v1
-robot_type: widowx
+scene_name: bridge_table_1_v2 # bridge_table_1_v2
+robot_type: widowx # widowx | google_robot
 
 seed: 42
 device: cuda:0
 #########################
-denoising_steps: 4
-ft_denoising_steps: 4
-min_std: 0.08
-max_std: 0.16
+denoising_steps: 10
+ft_denoising_steps: 10
+min_std: 0.08 # 0.08
+max_std: 0.16 # 0.16
 #########################
 
 env:
